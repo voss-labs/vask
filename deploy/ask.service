@@ -1,0 +1,40 @@
+[Unit]
+Description=VOSS Ask SSH server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ask
+Group=ask
+WorkingDirectory=/opt/ask
+# systemd boots services with empty TERM/COLORTERM. Without these,
+# lipgloss starts in "no color" mode and renders monochrome over SSH.
+Environment="TERM=xterm-256color"
+Environment="COLORTERM=truecolor"
+EnvironmentFile=/opt/ask/data/turso.env
+# Ask owns port 22 — sshd was moved to a high port (typically 22000)
+# during the cutover. CAP_NET_BIND_SERVICE lets the unprivileged
+# `ask` user bind to a privileged port without sudo.
+ExecStart=/opt/ask/ask \
+    --host 0.0.0.0 \
+    --port 22 \
+    --host-key /opt/ask/data/host_ed25519
+Restart=on-failure
+RestartSec=5
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+
+# hardening
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/opt/ask/data
+
+# do not log post content (logs already structured; this is belt + braces)
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

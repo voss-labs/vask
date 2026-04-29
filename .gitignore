@@ -1,0 +1,28 @@
+# binaries
+/bin/
+*.exe
+*.test
+*.prof
+
+# local data
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+data/
+backups/
+
+# host keys (generated locally; do not commit)
+host_ed25519
+host_ed25519.pub
+*.pem
+
+# editor / os
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# go
+go.work
+go.work.sum
