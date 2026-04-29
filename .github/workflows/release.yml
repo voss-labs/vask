@@ -116,7 +116,7 @@ jobs:
           target: "/tmp/"
           strip_components: 1
       - name: install + restart
-        uses: appleboy/ssh-action@v1.2.4
+        uses: appleboy/ssh-action@v1.2.5
         with:
           host: ${{ secrets.ORACLE_SSH_HOST }}
           port: ${{ secrets.ORACLE_SSH_PORT }}
