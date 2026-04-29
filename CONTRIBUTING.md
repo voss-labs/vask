@@ -13,7 +13,7 @@ make run
 ssh -p 2300 localhost
 ```
 
-Requires Go `>= 1.22`. No CGO (pure-Go SQLite via `modernc.org/sqlite`).
+Requires Go `>= 1.24`. No CGO (pure-Go SQLite via `modernc.org/sqlite`).
 
 For semantic search locally, drop Cloudflare Workers AI credentials into `.env` (see `.env.example`). Without them, `/` falls back to LIKE search.
 
