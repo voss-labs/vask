@@ -94,7 +94,12 @@ jobs:
           path: bin/
       - name: stage deploy artifacts
         run: |
-          umask 077
+          # NOTE: do NOT umask 077 here. scp-action runs in a Docker
+          # container under a different UID; if staged/ is mode 700 the
+          # container can't list it and drone-scp produces an empty tar
+          # ("tar: empty archive"). The runner workspace is ephemeral
+          # anyway — secret protection happens on the remote VM, where
+          # turso.env is written with `install -m 0600 -o vask -g vask`.
           mkdir -p staged
           cp bin/vask.linux-amd64 staged/vask.linux-amd64
           cp deploy/vask.service  staged/vask.service
@@ -104,6 +109,8 @@ jobs:
           CF_ACCOUNT_ID=${{ secrets.CF_ACCOUNT_ID }}
           CF_AI_TOKEN=${{ secrets.CF_AI_TOKEN }}
           EOF
+          chmod 755 staged
+          chmod 644 staged/*
           ls -la staged/
       - name: scp to oracle
         uses: appleboy/scp-action@v0.1.7
