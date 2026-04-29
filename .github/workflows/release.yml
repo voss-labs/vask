@@ -1,23 +1,45 @@
 name: release
 
+# Triggered by:
+#   - tag push v*.*.*       → test → build → release + deploy → smoke
+#   - manual dispatch       → test → build → deploy → smoke (no release)
+#
+# Sequential pipeline. Each stage is a separate job with needs:; failures
+# stop the chain. release.yml subsumes the old deploy.yml because
+# GITHUB_TOKEN-published Releases don't trigger downstream workflows
+# (see https://docs.github.com/en/actions/using-workflows/triggering-a-workflow).
+
 on:
   push:
     tags: ['v*.*.*']
+  workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
-  build:
+  test:
+    if: github.repository == 'voss-labs/vask'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-go@v5
         with:
           go-version: '1.22'
           cache: true
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go test ./... -race -timeout 60s
 
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
       - name: cross-compile
         run: |
           mkdir -p bin
@@ -29,9 +51,98 @@ jobs:
             done
           done
           ls -lh bin/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries
+          path: bin/
+          retention-days: 7
 
-      - name: release
-        uses: softprops/action-gh-release@v2
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: binaries
+          path: bin/
+      - uses: softprops/action-gh-release@v2
         with:
           files: bin/*
           generate_release_notes: true
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: binaries
+          path: bin/
+      - name: stage env file
+        run: |
+          umask 077
+          mkdir -p /tmp/dist
+          cp bin/vask.linux-amd64 /tmp/dist/vask.linux-amd64
+          cat > /tmp/dist/turso.env <<EOF
+          TURSO_DATABASE_URL=${{ secrets.TURSO_DATABASE_URL }}
+          TURSO_AUTH_TOKEN=${{ secrets.TURSO_AUTH_TOKEN }}
+          CF_ACCOUNT_ID=${{ secrets.CF_ACCOUNT_ID }}
+          CF_AI_TOKEN=${{ secrets.CF_AI_TOKEN }}
+          EOF
+      - name: scp to oracle
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.ORACLE_SSH_HOST }}
+          port: ${{ secrets.ORACLE_SSH_PORT }}
+          username: ${{ secrets.ORACLE_SSH_USER }}
+          key: ${{ secrets.ORACLE_SSH_KEY }}
+          source: "/tmp/dist/vask.linux-amd64,/tmp/dist/turso.env,deploy/vask.service"
+          target: "/tmp/"
+          strip_components: 2
+      - name: install + restart
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.ORACLE_SSH_HOST }}
+          port: ${{ secrets.ORACLE_SSH_PORT }}
+          username: ${{ secrets.ORACLE_SSH_USER }}
+          key: ${{ secrets.ORACLE_SSH_KEY }}
+          script: |
+            set -euo pipefail
+            sudo install -o vask -g vask -m 0755 /tmp/vask.linux-amd64 /opt/vask/vask
+            sudo install -o vask -g vask -m 0600 /tmp/turso.env       /opt/vask/data/turso.env
+            sudo mv /tmp/vask.service /etc/systemd/system/
+            sudo systemctl daemon-reload
+            sudo systemctl restart vask
+            sleep 2
+            sudo systemctl status vask --no-pager -l --lines=10
+
+  smoke:
+    needs: deploy
+    runs-on: ubuntu-latest
+    steps:
+      - name: probe IP + domain
+        run: |
+          set -e
+          sleep 3
+
+          probe() {
+            local label="$1" host="$2"
+            if ! nc -z -w 10 "$host" 22; then
+              echo "::error::tcp/22 unreachable at $label ($host)"
+              return 1
+            fi
+            local banner
+            banner=$(echo "" | nc -w 5 "$host" 22 2>&1 | head -1 | tr -d '\r')
+            if echo "$banner" | grep -q "SSH-2"; then
+              echo "::notice::$label OK — banner: $banner"
+              return 0
+            fi
+            echo "::error::$label answered tcp/22 but no SSH-2 banner: $banner"
+            return 1
+          }
+
+          probe "IP"     "${{ secrets.ORACLE_SSH_HOST }}"
+          probe "domain" "vask.vosslabs.org" || \
+            echo "::warning::domain probe failed — likely DNS not yet propagated"
