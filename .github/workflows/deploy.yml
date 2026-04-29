@@ -62,3 +62,28 @@ jobs:
             sudo systemctl restart vask
             sleep 2
             sudo systemctl status vask --no-pager -l --lines=10
+
+      - name: smoke test (IP + domain)
+        run: |
+          set -e
+          sleep 3   # give vask a beat to bind port 22
+
+          probe() {
+            local label="$1" host="$2"
+            if ! nc -z -w 10 "$host" 22; then
+              echo "::error::tcp/22 unreachable at $label ($host)"
+              return 1
+            fi
+            local banner
+            banner=$(echo "" | nc -w 5 "$host" 22 2>&1 | head -1 | tr -d '\r')
+            if echo "$banner" | grep -q "SSH-2"; then
+              echo "::notice::$label OK — banner: $banner"
+              return 0
+            fi
+            echo "::error::$label answered tcp/22 but no SSH-2 banner: $banner"
+            return 1
+          }
+
+          probe "IP"     "${{ secrets.ORACLE_SSH_HOST }}"
+          probe "domain" "vask.vosslabs.org" || \
+            echo "::warning::domain probe failed — likely DNS not yet propagated"

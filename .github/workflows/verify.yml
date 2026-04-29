@@ -1,0 +1,40 @@
+name: verify
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'   # every 30 minutes
+  workflow_dispatch:
+
+jobs:
+  uptime:
+    if: github.repository == 'voss-labs/vask'
+    runs-on: ubuntu-latest
+    steps:
+      - name: probe by IP
+        run: |
+          set -e
+          host="${{ secrets.ORACLE_SSH_HOST }}"
+          if ! nc -z -w 10 "$host" 22; then
+            echo "::error::tcp/22 unreachable on IP"
+            exit 1
+          fi
+          banner=$(echo "" | nc -w 5 "$host" 22 2>&1 | head -1 | tr -d '\r')
+          if ! echo "$banner" | grep -q "SSH-2"; then
+            echo "::error::IP answered tcp/22 but no SSH-2 banner: $banner"
+            exit 1
+          fi
+          echo "✓ IP banner: $banner"
+
+      - name: probe by domain
+        run: |
+          set -e
+          if ! nc -z -w 10 vask.vosslabs.org 22; then
+            echo "::error::tcp/22 unreachable on vask.vosslabs.org"
+            exit 1
+          fi
+          banner=$(echo "" | nc -w 5 vask.vosslabs.org 22 2>&1 | head -1 | tr -d '\r')
+          if ! echo "$banner" | grep -q "SSH-2"; then
+            echo "::error::domain answered tcp/22 but no SSH-2 banner: $banner"
+            exit 1
+          fi
+          echo "✓ domain banner: $banner"
