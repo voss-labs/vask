@@ -2,7 +2,7 @@ name: verify
 
 on:
   schedule:
-    - cron: '*/30 * * * *'   # every 30 minutes
+    - cron: '0 * * * *'   # hourly, on the hour
   workflow_dispatch:
 
 jobs:
