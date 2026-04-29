@@ -7,32 +7,57 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
-	"github.com/voss-labs/ask/internal/store"
+	"github.com/voss-labs/vask/internal/store"
 )
 
-// App is the top-level model. State machine:
+// minTermWidth / minTermHeight — below these we refuse to render the
+// normal frame and show a "resize me" message instead. The frame width
+// is 78; anything narrower than ~60 produces visible truncation, and
+// fewer than ~18 rows hides the footer or pushes a post off-screen.
+const (
+	minTermWidth  = 60
+	minTermHeight = 18
+)
+
+// App is the top-level model. State machine (post-tags pivot, post-username):
 //
-//	splash ─(any key)─▶ channels ─(enter)─▶ feed ⇄ compose
-//	                       ▲                  │
-//	                       └──── 'c' ─────────┤
-//	                                          ▼
-//	                                       detail ─(b)─▶ feed
+//	splash ─(any key)─▶ onboard ─(enter)─▶ feed ⇄ compose
+//	                      │                  │
+//	                      │                  ▼
+//	                      │                detail ─(b/esc)─▶ feed
+//	                      ▼
+//	  (existing users with a username skip straight to feed)
+//
+// Onboarding is the one-time handle picker — first-connect users go through
+// it after accepting the TOS; users with a username already set go straight
+// to the feed.
+//
+// stashedFeed: when the user navigates feed → detail or feed → compose, we
+// hold onto the live feed model and restore it on return instead of
+// rebuilding from scratch. That preserves cursor position, filter state,
+// scroll offset, and the lastFeedAt snapshot — so the unread divider and
+// the scroll position both behave correctly across navigation, and the
+// returning view feels free (the stale data renders instantly while a
+// background refresh runs).
 type App struct {
 	st   *store.Store
 	user *store.User
 
-	current tea.Model
-	width   int
-	height  int
-	channel string // empty = "all channels" feed
+	current     tea.Model
+	stashedFeed tea.Model // saved feed model while we're in detail/compose
+	width       int
+	height     int
 }
 
 func NewApp(st *store.Store, user *store.User) App {
 	app := App{st: st, user: user}
-	if user.TOSAcceptedAt != nil {
-		app.current = newChannelPicker(st)
-	} else {
+	switch {
+	case user.TOSAcceptedAt == nil:
 		app.current = newSplash()
+	case user.Username == "":
+		app.current = newOnboard(st, user)
+	default:
+		app.current = newFeed(st, user)
 	}
 	return app
 }
@@ -53,52 +78,77 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		_ = a.st.AcceptTOS(ctx, a.user.ID)
 		now := time.Now()
 		a.user.TOSAcceptedAt = &now
-		picker := newChannelPicker(a.st)
-		a.current = picker
-		return a, tea.Batch(picker.Init(), a.forwardSize())
-
-	case selectChannelMsg:
-		a.channel = m.slug
-		feed := newFeed(a.st, a.user, a.channel)
+		// New users still need to pick a handle. Existing users with a
+		// username already set (somehow accepted TOS but not onboarded)
+		// fall through to the feed.
+		if a.user.Username == "" {
+			ob := newOnboard(a.st, a.user)
+			a.current = ob
+			return a, tea.Batch(ob.Init(), a.forwardSize())
+		}
+		feed := newFeed(a.st, a.user)
 		a.current = feed
 		return a, tea.Batch(feed.Init(), a.forwardSize())
 
-	case backToChannelsMsg:
-		picker := newChannelPicker(a.st)
-		a.current = picker
-		return a, tea.Batch(picker.Init(), a.forwardSize())
+	case usernameAcceptedMsg:
+		a.user.Username = m.username
+		feed := newFeed(a.st, a.user)
+		a.current = feed
+		return a, tea.Batch(feed.Init(), a.forwardSize())
 
 	case openComposeMsg:
-		c := newCompose(a.st, a.user, m.channel)
+		// Stash whatever's current (the feed) so we can restore on cancel
+		// or submit instead of rebuilding it.
+		if _, ok := a.current.(feedModel); ok {
+			a.stashedFeed = a.current
+		}
+		c := newCompose(a.st, a.user)
 		a.current = c
 		return a, tea.Batch(c.Init(), a.forwardSize())
 
 	case composeCancelledMsg:
-		feed := newFeed(a.st, a.user, a.channel)
-		a.current = feed
-		return a, tea.Batch(feed.Init(), a.forwardSize())
+		return a.restoreFeedOrFresh()
 
 	case composeSubmittedMsg:
-		// jump into the channel we just posted to so the user sees their post
-		a.channel = m.channel
-		feed := newFeed(a.st, a.user, a.channel)
-		a.current = feed
-		return a, tea.Batch(feed.Init(), a.forwardSize())
+		// Ignoring m.postID for now — feed refresh will surface the new
+		// post at the top under SortHot/New.
+		_ = m
+		return a.restoreFeedOrFresh()
 
 	case openDetailMsg:
+		if _, ok := a.current.(feedModel); ok {
+			a.stashedFeed = a.current
+		}
 		d := newDetail(a.st, a.user, m.postID)
 		a.current = d
 		return a, tea.Batch(d.Init(), a.forwardSize())
 
 	case closeDetailMsg:
-		feed := newFeed(a.st, a.user, a.channel)
-		a.current = feed
-		return a, tea.Batch(feed.Init(), a.forwardSize())
+		return a.restoreFeedOrFresh()
 	}
 
 	next, cmd := a.current.Update(msg)
 	a.current = next
 	return a, cmd
+}
+
+// restoreFeedOrFresh returns to the feed view. Prefers the stashed live
+// model (preserves cursor, filters, scroll, lastFeedAt snapshot) and
+// fires a feedRefreshMsg to pull updated data in the background. Falls
+// back to a fresh feed model if nothing was stashed (which only happens
+// on first paint after onboard / TOS acceptance).
+func (a App) restoreFeedOrFresh() (tea.Model, tea.Cmd) {
+	if a.stashedFeed != nil {
+		a.current = a.stashedFeed
+		a.stashedFeed = nil
+		return a, tea.Batch(
+			func() tea.Msg { return feedRefreshMsg{} },
+			a.forwardSize(),
+		)
+	}
+	feed := newFeed(a.st, a.user)
+	a.current = feed
+	return a, tea.Batch(feed.Init(), a.forwardSize())
 }
 
 func (a App) forwardSize() tea.Cmd {
@@ -110,6 +160,16 @@ func (a App) forwardSize() tea.Cmd {
 }
 
 func (a App) View() string {
+	// Tiny terminals get a friendly nudge instead of a mangled frame.
+	// The frame is 78 wide and renders ~14+ rows; anything smaller
+	// destroys the layout and produces stuck-looking screens.
+	if a.width > 0 && a.height > 0 && (a.width < minTermWidth || a.height < minTermHeight) {
+		return lipgloss.Place(a.width, a.height,
+			lipgloss.Center, lipgloss.Center,
+			renderTooSmall(a.width, a.height),
+		)
+	}
+
 	content := a.current.View()
 	if a.width > 0 && a.height > 0 {
 		return lipgloss.Place(a.width, a.height, lipgloss.Center, lipgloss.Center, content)
@@ -117,15 +177,56 @@ func (a App) View() string {
 	return content
 }
 
+func renderTooSmall(w, h int) string {
+	title := brandText.Render("voss / vask")
+	tag := textDim.Render("terminal too small")
+	body := textBody.Render(
+		"please resize your terminal to at least\n" +
+			"  60 cols × 18 rows  for a good experience.",
+	)
+	current := textMute.Render(
+		"current size: " + itoa(w) + " × " + itoa(h),
+	)
+	return lipgloss.JoinVertical(lipgloss.Center, title, tag, "", body, "", current)
+}
+
+// itoa is the minimal int→string helper used in the resize message;
+// avoids pulling in fmt for one stringification.
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	neg := false
+	if n < 0 {
+		neg = true
+		n = -n
+	}
+	var buf [20]byte
+	i := len(buf)
+	for n > 0 {
+		i--
+		buf[i] = byte('0' + n%10)
+		n /= 10
+	}
+	if neg {
+		i--
+		buf[i] = '-'
+	}
+	return string(buf[i:])
+}
+
 // === inter-view messages ===============================================
 
-type selectChannelMsg struct{ slug string } // "" = all-channels feed
-type backToChannelsMsg struct{}
-type openComposeMsg struct{ channel string }
+type openComposeMsg struct{}
 type composeCancelledMsg struct{}
 type composeSubmittedMsg struct {
-	postID  int64
-	channel string
+	postID int64
 }
 type openDetailMsg struct{ postID int64 }
 type closeDetailMsg struct{}
+
+// feedRefreshMsg is dispatched by App when the feed model is restored
+// from a stash (after detail or compose). The feed handles it as a
+// trigger to rebuild ListPostsParams and refetch — so users see the
+// latest state without losing their cursor.
+type feedRefreshMsg struct{}

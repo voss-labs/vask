@@ -26,3 +26,13 @@ host_ed25519.pub
 # go
 go.work
 go.work.sum
+
+# secrets — deploy scripts read from .env / .env.local
+# .env.example is the only env file that's safe to track
+.env
+.env.local
+.env.*
+!.env.example
+
+# operator-only one-shot scripts (kept locally, never committed)
+deploy/reset-vm.sh

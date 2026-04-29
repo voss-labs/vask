@@ -1,4 +1,4 @@
--- 001_init.sql — initial schema for voss-ask v0.1
+-- 001_init.sql — initial schema for vask
 --
 -- Identity is the SHA256 of the marshalled SSH public key.
 -- The raw key is never stored; the hash is irreversible.

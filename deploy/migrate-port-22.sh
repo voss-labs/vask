@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# migrate-port-22.sh — one-time cutover from "ssh -p 2200 ask.vosslabs.org"
-# to "ssh ask.vosslabs.org".
+# migrate-port-22.sh — one-time cutover from "ssh -p 2200 vask.vosslabs.org"
+# to "ssh vask.vosslabs.org".
 #
 # Moves the VM's sshd to port 22000, then re-deploys ask on port 22.
 # Idempotent: re-running after success is a no-op.
@@ -172,7 +172,7 @@ cat <<EOM
 
   ${c_brand}share-anywhere command:${c_reset}
 
-    ${c_brand}ssh ask.vosslabs.org${c_reset}
+    ${c_brand}ssh vask.vosslabs.org${c_reset}
 
   ${c_dim}management ssh going forward:${c_reset}
 

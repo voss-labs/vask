@@ -1,0 +1,33 @@
+[Unit]
+Description=vask SSH server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vask
+Group=vask
+WorkingDirectory=/opt/vask
+Environment="TERM=xterm-256color"
+Environment="COLORTERM=truecolor"
+EnvironmentFile=/opt/vask/data/turso.env
+ExecStart=/opt/vask/vask \
+    --host 0.0.0.0 \
+    --port 22 \
+    --host-key /opt/vask/data/host_ed25519
+Restart=on-failure
+RestartSec=5
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/opt/vask/data
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

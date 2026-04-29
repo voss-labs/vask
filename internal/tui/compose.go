@@ -11,33 +11,47 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
-	"github.com/voss-labs/ask/internal/policy"
-	"github.com/voss-labs/ask/internal/ratelimit"
-	"github.com/voss-labs/ask/internal/store"
+	"github.com/voss-labs/vask/internal/policy"
+	"github.com/voss-labs/vask/internal/ratelimit"
+	"github.com/voss-labs/vask/internal/store"
 )
 
 const (
 	maxTitleChars = 120
 	maxBodyChars  = 2000
+	maxTagsChars  = 100
+	maxTagsPerPost = 5
 
-	stepChannel = 0
-	stepTitle   = 1
-	stepBody    = 2
+	stepTitle = 0
+	stepBody  = 1
+	stepTags  = 2
 )
+
+// Seed suggestions when the DB has fewer than 6 distinct tags. Once enough
+// real tags exist, suggestions come from data.
+var seedTagSuggestions = []string{
+	"complaints", "electives", "hostel", "mess", "canteen",
+	"exams", "placement", "internship", "lost-found", "study-group", "general", "meta",
+}
 
 type composeModel struct {
 	st      *store.Store
 	user    *store.User
 	limiter *ratelimit.PostLimiter
 
-	channels      []store.Channel
-	chanIdx       int
-	channelLocked bool // when entering compose from a channel feed, the channel is pre-selected
-	preset        string
-
 	title textinput.Model
 	body  textarea.Model
+	tags  textinput.Model
 	step  int
+
+	suggestions []string
+	// similarTags is the union of tags used by the 3 most semantically
+	// similar existing posts to the current draft (title+body). Surfaced
+	// at the tags step so writers can pick tags that match how *other
+	// people* tagged related discussion. Empty when embeddings aren't
+	// configured, when the user has typed too little to embed, or when
+	// no similar posts exist yet.
+	similarTags []string
 
 	width  int
 	height int
@@ -47,20 +61,26 @@ type composeModel struct {
 
 	flagsAck bool
 	sending  bool
+
+	// Esc on a non-empty draft arms this; the next `y` confirms discard,
+	// anything else cancels. Saves users from one-keystroke draft loss.
+	pendingDiscard bool
 }
 
 type composePostedMsg struct {
-	id      int64
-	channel string
-	err     error
+	id  int64
+	err error
 }
 
-type composeChannelsMsg struct {
-	channels []store.Channel
-	err      error
+type composeSuggestionsMsg struct {
+	tags []string
 }
 
-func newCompose(st *store.Store, user *store.User, presetChannel string) composeModel {
+type composeSimilarTagsMsg struct {
+	tags []string
+}
+
+func newCompose(st *store.Store, user *store.User) composeModel {
 	title := textinput.New()
 	title.Placeholder = "one-line title — what's the question or rant?"
 	title.Width = ContentWidth - 4
@@ -80,32 +100,83 @@ func newCompose(st *store.Store, user *store.User, presetChannel string) compose
 	body.BlurredStyle.Base = lipgloss.NewStyle()
 	body.Cursor.Style = lipgloss.NewStyle().Foreground(colorBrand)
 
+	tags := textinput.New()
+	tags.Placeholder = "comma-separated, e.g. electives, cs, study-group"
+	tags.Width = ContentWidth - 4
+	tags.CharLimit = maxTagsChars
+	tags.Prompt = ""
+	tags.Cursor.Style = lipgloss.NewStyle().Foreground(colorBrand)
+
 	c := composeModel{
-		st:            st,
-		user:          user,
-		limiter:       ratelimit.NewPostLimiter(st, 5),
-		title:         title,
-		body:          body,
-		channelLocked: presetChannel != "",
-		preset:        presetChannel,
-		step:          stepChannel,
+		st:      st,
+		user:    user,
+		limiter: ratelimit.NewPostLimiter(st, 5),
+		title:   title,
+		body:    body,
+		tags:    tags,
+		step:    stepTitle,
 	}
-	if c.channelLocked {
-		c.step = stepTitle
-	}
-	return c
+	// FOCUS BUG FIX: focus the initial step's input so the very first keystroke
+	// types into it. Previously the focus was never set, so users had to press
+	// Enter once before typing would land.
+	return c.applyStepFocus()
 }
 
 func (m composeModel) Init() tea.Cmd {
-	return tea.Batch(textarea.Blink, loadComposeChannels(m.st))
+	cmds := []tea.Cmd{textarea.Blink, loadTagSuggestions(m.st)}
+	// kick the cursor blink for the title input as well
+	cmds = append(cmds, m.title.Cursor.BlinkCmd())
+	return tea.Batch(cmds...)
 }
 
-func loadComposeChannels(st *store.Store) tea.Cmd {
+func loadTagSuggestions(st *store.Store) tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		ch, err := st.ListChannels(ctx)
-		return composeChannelsMsg{channels: ch, err: err}
+		tags, err := st.ListPopularTags(ctx, 8)
+		if err != nil {
+			return composeSuggestionsMsg{tags: nil}
+		}
+		return composeSuggestionsMsg{tags: tags}
+	}
+}
+
+// loadSimilarTags embeds the current draft (title + body) and surfaces
+// the tag union from the 3 most similar existing posts. No-op when no
+// embedding client is configured or the draft is too short to be
+// meaningful — we want suggestions to feel relevant, not random.
+func loadSimilarTags(st *store.Store, title, body string) tea.Cmd {
+	return func() tea.Msg {
+		client := st.EmbedClient()
+		if client == nil {
+			return composeSimilarTagsMsg{}
+		}
+		text := strings.TrimSpace(title + "\n\n" + body)
+		if len(text) < 10 {
+			return composeSimilarTagsMsg{}
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+		defer cancel()
+		v, err := client.Embed(ctx, text)
+		if err != nil {
+			return composeSimilarTagsMsg{}
+		}
+		posts, err := st.NearestPostsByVector(ctx, v, 3)
+		if err != nil {
+			return composeSimilarTagsMsg{}
+		}
+		seen := map[string]bool{}
+		var tags []string
+		for _, p := range posts {
+			for _, t := range p.Tags {
+				if seen[t] {
+					continue
+				}
+				seen[t] = true
+				tags = append(tags, t)
+			}
+		}
+		return composeSimilarTagsMsg{tags: tags}
 	}
 }
 
@@ -113,22 +184,26 @@ func (m composeModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
-	case composeChannelsMsg:
-		m.channels = msg.channels
-		if msg.err != nil {
-			m.status = "couldn't load channels: " + msg.err.Error()
-			m.statusKind = "err"
-			return m, nil
-		}
-		// align chanIdx to preset slug if any
-		if m.preset != "" {
-			for i, c := range m.channels {
-				if c.Slug == m.preset {
-					m.chanIdx = i
+	case composeSuggestionsMsg:
+		m.suggestions = msg.tags
+		// fall back to seed list if DB is sparse
+		if len(m.suggestions) < 6 {
+			seen := map[string]bool{}
+			for _, t := range m.suggestions {
+				seen[t] = true
+			}
+			for _, t := range seedTagSuggestions {
+				if !seen[t] {
+					m.suggestions = append(m.suggestions, t)
+				}
+				if len(m.suggestions) >= 8 {
 					break
 				}
 			}
 		}
+
+	case composeSimilarTagsMsg:
+		m.similarTags = msg.tags
 	case composePostedMsg:
 		m.sending = false
 		if msg.err != nil {
@@ -136,70 +211,73 @@ func (m composeModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.statusKind = "err"
 			return m, nil
 		}
-		return m, func() tea.Msg { return composeSubmittedMsg{postID: msg.id, channel: msg.channel} }
+		return m, func() tea.Msg { return composeSubmittedMsg{postID: msg.id} }
 	case tea.KeyMsg:
 		if m.sending {
 			return m, nil
 		}
+		// While a discard is armed, intercept `y` to confirm and any other
+		// key (including esc) to cancel the prompt. ctrl+c still quits.
+		if m.pendingDiscard {
+			switch msg.String() {
+			case "ctrl+c":
+				return m, tea.Quit
+			case "y", "Y":
+				return m, func() tea.Msg { return composeCancelledMsg{} }
+			default:
+				m.pendingDiscard = false
+				m.status = ""
+				return m, nil
+			}
+		}
+
 		switch msg.String() {
 		case "ctrl+c":
 			return m, tea.Quit
 		case "esc":
-			if m.step == stepChannel || (m.channelLocked && m.step == stepTitle) {
+			if m.step == stepTitle {
+				if m.hasDraftContent() {
+					m.pendingDiscard = true
+					m.status = "discard draft? press y to throw it away · any other key keeps editing."
+					m.statusKind = "warn"
+					return m, nil
+				}
 				return m, func() tea.Msg { return composeCancelledMsg{} }
 			}
 			m.step--
-			if m.channelLocked && m.step == stepChannel {
-				m.step = stepTitle
-			}
 			m.clearStatus()
-			return m.applyStepFocus(), nil
+			return m.advanceStep()
 		case "shift+tab":
-			if m.step > stepChannel {
+			if m.step > stepTitle {
 				m.step--
-				if m.channelLocked && m.step == stepChannel {
-					m.step = stepTitle
-				}
 				m.clearStatus()
-				return m.applyStepFocus(), nil
+				return m.advanceStep()
 			}
 		case "tab":
-			if m.step < stepBody {
+			if m.step < stepTags {
 				m.step++
 				m.clearStatus()
-				return m.applyStepFocus(), nil
+				return m.advanceStep()
 			}
 		case "enter":
-			if m.step != stepBody {
-				m.step++
-				m.clearStatus()
-				return m.applyStepFocus(), nil
+			// Enter advances on title and tags steps; in body it inserts a newline.
+			if m.step == stepTitle || m.step == stepTags {
+				if m.step < stepTags {
+					m.step++
+					m.clearStatus()
+					return m.advanceStep()
+				}
+				// on tags step, enter = submit
+				return m.submit()
 			}
+			// step == stepBody: fall through to textarea
 		case "ctrl+s":
-			if m.step != stepBody {
-				m.step = stepBody
+			if m.step != stepTags {
+				m.step = stepTags
 				m.clearStatus()
-				return m.applyStepFocus(), nil
+				return m.advanceStep()
 			}
 			return m.submit()
-		case "left", "h":
-			if m.step == stepChannel && m.chanIdx > 0 {
-				m.chanIdx--
-				return m, nil
-			}
-		case "right", "l":
-			if m.step == stepChannel && m.chanIdx < len(m.channels)-1 {
-				m.chanIdx++
-				return m, nil
-			}
-		case "1", "2", "3", "4", "5", "6", "7", "8", "9":
-			if m.step == stepChannel {
-				idx := int(msg.String()[0] - '1')
-				if idx >= 0 && idx < len(m.channels) {
-					m.chanIdx = idx
-				}
-				return m, nil
-			}
 		}
 	}
 
@@ -209,6 +287,8 @@ func (m composeModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.title, cmd = m.title.Update(msg)
 	case stepBody:
 		m.body, cmd = m.body.Update(msg)
+	case stepTags:
+		m.tags, cmd = m.tags.Update(msg)
 	}
 	return m, cmd
 }
@@ -216,13 +296,29 @@ func (m composeModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m composeModel) applyStepFocus() composeModel {
 	m.title.Blur()
 	m.body.Blur()
+	m.tags.Blur()
 	switch m.step {
 	case stepTitle:
 		m.title.Focus()
 	case stepBody:
 		m.body.Focus()
+	case stepTags:
+		m.tags.Focus()
 	}
 	return m
+}
+
+// advanceStep is the focus-shift wrapper used by every step transition
+// (tab / shift+tab / enter / esc-back). It applies the step's focus AND
+// fires the similar-tags suggestion query whenever we land on stepTags
+// — that's the only step where the suggestion is shown, and we want
+// it refreshed each visit so it reflects the latest body content.
+func (m composeModel) advanceStep() (tea.Model, tea.Cmd) {
+	m = m.applyStepFocus()
+	if m.step == stepTags {
+		return m, loadSimilarTags(m.st, m.title.Value(), m.body.Value())
+	}
+	return m, nil
 }
 
 func (m *composeModel) clearStatus() {
@@ -231,9 +327,36 @@ func (m *composeModel) clearStatus() {
 	m.flagsAck = false
 }
 
+// hasDraftContent reports whether the user has typed anything worth
+// confirming a discard for. Pure whitespace doesn't count.
+func (m composeModel) hasDraftContent() bool {
+	return strings.TrimSpace(m.title.Value()) != "" ||
+		strings.TrimSpace(m.body.Value()) != "" ||
+		strings.TrimSpace(m.tags.Value()) != ""
+}
+
+func (m composeModel) parsedTags() []string {
+	raw := strings.Split(m.tags.Value(), ",")
+	seen := map[string]bool{}
+	out := make([]string, 0, len(raw))
+	for _, t := range raw {
+		n := store.NormalizeTag(t)
+		if n == "" || seen[n] {
+			continue
+		}
+		seen[n] = true
+		out = append(out, n)
+		if len(out) >= maxTagsPerPost {
+			break
+		}
+	}
+	return out
+}
+
 func (m composeModel) submit() (tea.Model, tea.Cmd) {
 	title := strings.TrimSpace(m.title.Value())
 	body := strings.TrimSpace(m.body.Value())
+	tags := m.parsedTags()
 
 	if title == "" {
 		m.status = "title is empty."
@@ -244,17 +367,19 @@ func (m composeModel) submit() (tea.Model, tea.Cmd) {
 	if body == "" {
 		m.status = "body is empty."
 		m.statusKind = "err"
-		return m, nil
+		m.step = stepBody
+		return m.applyStepFocus(), nil
 	}
 	if len(body) > maxBodyChars {
 		m.status = fmt.Sprintf("body too long (%d / %d).", len(body), maxBodyChars)
 		m.statusKind = "err"
 		return m, nil
 	}
-	if len(m.channels) == 0 || m.chanIdx < 0 || m.chanIdx >= len(m.channels) {
-		m.status = "pick a valid channel."
+	if len(tags) == 0 {
+		m.status = "add at least one tag (so people can find this)."
 		m.statusKind = "err"
-		return m, nil
+		m.step = stepTags
+		return m.applyStepFocus(), nil
 	}
 
 	if !m.flagsAck {
@@ -264,7 +389,7 @@ func (m composeModel) submit() (tea.Model, tea.Cmd) {
 			for i, f := range flags {
 				kinds[i] = f.Kind
 			}
-			m.status = fmt.Sprintf("heads up — looks like %s. press ctrl+s again to send anyway.",
+			m.status = fmt.Sprintf("heads up — looks like %s. press enter again to send anyway.",
 				strings.Join(kinds, ", "))
 			m.statusKind = "warn"
 			m.flagsAck = true
@@ -286,7 +411,6 @@ func (m composeModel) submit() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	channel := m.channels[m.chanIdx].Slug
 	m.sending = true
 	m.status = "sending…"
 	m.statusKind = "ok"
@@ -296,29 +420,29 @@ func (m composeModel) submit() (tea.Model, tea.Cmd) {
 	return m, func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		id, err := st.CreatePost(ctx, uid, channel, title, body)
-		return composePostedMsg{id: id, channel: channel, err: err}
+		id, err := st.CreatePost(ctx, uid, title, body, tags)
+		return composePostedMsg{id: id, err: err}
 	}
 }
 
 // === view ============================================================
 
 func (m composeModel) View() string {
-	header := renderComposeHeader(m.step, m.totalSteps())
-	dots := renderStepDots(m.step, m.totalSteps())
+	header := renderComposeHeader(m.step)
+	dots := renderStepDots(m.step)
 
 	var stepBlock string
 	switch m.step {
-	case stepChannel:
-		stepBlock = renderChannelStep(m.channels, m.chanIdx)
 	case stepTitle:
 		stepBlock = renderTitleStep(m)
 	case stepBody:
 		stepBlock = renderBodyStep(m)
+	case stepTags:
+		stepBlock = renderTagsStep(m)
 	}
 
 	bread := ""
-	if m.step > stepChannel || m.channelLocked {
+	if m.step > stepTitle {
 		bread = renderComposeBreadcrumb(m)
 	}
 
@@ -327,27 +451,16 @@ func (m composeModel) View() string {
 		statusLine = renderStatus(m.status, m.statusKind)
 	}
 
-	footer := renderComposeFooter(m.step, m.channelLocked)
+	footer := renderComposeFooter(m.step)
 
 	body := lipgloss.JoinVertical(lipgloss.Left, header, dots, bread, stepBlock, statusLine, footer)
 	return frameStyle.Render(body)
 }
 
-func (m composeModel) totalSteps() int {
-	if m.channelLocked {
-		return 2
-	}
-	return 3
-}
-
-func renderComposeHeader(step, total int) string {
-	stepLabel := []string{"channel", "title", "body"}[step]
-	left := brandText.Render("voss") + textMute.Render(" / ") + brandText.Render("ask")
-	stepIdx := step + 1
-	if total == 2 && step > 0 {
-		stepIdx = step
-	}
-	right := textDim.Render(fmt.Sprintf("new post · %d/%d · %s", stepIdx, total, stepLabel))
+func renderComposeHeader(step int) string {
+	stepLabel := []string{"title", "body", "tags"}[step]
+	left := brandText.Render("voss") + textMute.Render(" / ") + brandText.Render("vask")
+	right := textDim.Render(fmt.Sprintf("new post · %d/3 · %s", step+1, stepLabel))
 	gap := ContentWidth - lipgloss.Width(left) - lipgloss.Width(right)
 	if gap < 1 {
 		gap = 1
@@ -355,19 +468,15 @@ func renderComposeHeader(step, total int) string {
 	return headerStyle.Render(left + strings.Repeat(" ", gap) + right)
 }
 
-func renderStepDots(step, total int) string {
+func renderStepDots(step int) string {
 	on := lipgloss.NewStyle().Foreground(colorBrand)
 	off := lipgloss.NewStyle().Foreground(colorBorder)
-	dots := make([]string, total)
-	curIdx := step
-	if total == 2 && step > 0 {
-		curIdx = step - 1
-	}
+	dots := []string{"●", "●", "●"}
 	for i := range dots {
 		switch {
-		case i == curIdx:
+		case i == step:
 			dots[i] = on.Bold(true).Render("●")
-		case i < curIdx:
+		case i < step:
 			dots[i] = on.Render("●")
 		default:
 			dots[i] = off.Render("○")
@@ -380,38 +489,21 @@ func renderStepDots(step, total int) string {
 
 func renderComposeBreadcrumb(m composeModel) string {
 	var parts []string
-	if m.chanIdx >= 0 && m.chanIdx < len(m.channels) {
-		parts = append(parts, catBadgeOn.Render("#"+m.channels[m.chanIdx].Slug))
+	t := strings.TrimSpace(m.title.Value())
+	if t == "" {
+		t = "(no title yet)"
 	}
-	if m.step >= stepBody {
-		t := strings.TrimSpace(m.title.Value())
-		if t == "" {
-			t = "(no title yet)"
+	parts = append(parts, postHint.PaddingLeft(0).Render(`"`+truncateRunes(t, 50)+`"`))
+	if m.step >= stepTags {
+		// show first 80 chars of body inline as second crumb
+		b := strings.TrimSpace(m.body.Value())
+		if b != "" {
+			b = strings.ReplaceAll(b, "\n", " ")
+			parts = append(parts, textMute.Render(truncateRunes(b, 50)))
 		}
-		parts = append(parts, postHint.PaddingLeft(0).Render(`"`+truncateRunes(t, 40)+`"`))
 	}
 	row := strings.Join(parts, textMute.Render("  ·  "))
 	return lipgloss.NewStyle().Width(ContentWidth).MarginBottom(1).Render(row)
-}
-
-func renderChannelStep(channels []store.Channel, sel int) string {
-	prompt := textBody.Render("pick a channel for your post")
-	rows := []string{prompt, ""}
-	for i, c := range channels {
-		num := textMute.Render(fmt.Sprintf("%d", i+1))
-		name := "#" + c.Slug
-		var styled string
-		if i == sel {
-			styled = num + " " + catFocusBracket.Render("‹ ") + catBadgeOn.Render(name) + catFocusBracket.Render(" ›") +
-				textDim.Render("   "+c.Description)
-		} else {
-			styled = num + " " + catBadgeOff.Render(name) + textDim.Render("   "+c.Description)
-		}
-		rows = append(rows, "  "+styled)
-	}
-	rows = append(rows, "")
-	rows = append(rows, textMute.Render(fmt.Sprintf("use ←→ or 1-%d · enter to continue", len(channels))))
-	return lipgloss.NewStyle().PaddingTop(1).PaddingBottom(1).Render(strings.Join(rows, "\n"))
 }
 
 func renderTitleStep(m composeModel) string {
@@ -420,20 +512,102 @@ func renderTitleStep(m composeModel) string {
 	counter := lipgloss.NewStyle().
 		Width(ContentWidth).Align(lipgloss.Right).Foreground(colorTextMute).
 		Render(fmt.Sprintf("%d / %d", len(m.title.Value()), maxTitleChars))
-	hint := textMute.Render("enter to continue · shift+tab back · esc back")
+	hint := textMute.Render("enter to continue · esc to cancel")
 	return lipgloss.NewStyle().PaddingTop(1).PaddingBottom(1).Render(
 		strings.Join([]string{prompt, "", box, counter, "", hint}, "\n"),
 	)
 }
 
 func renderBodyStep(m composeModel) string {
-	prompt := textBody.Render("body")
+	prompt := textBody.Render("body — context, what you've tried, links")
 	box := formBoxFocused.Render(m.body.View())
 	counter := lipgloss.NewStyle().
 		Width(ContentWidth).Align(lipgloss.Right).Foreground(colorTextMute).
 		Render(fmt.Sprintf("%d / %d", len(m.body.Value()), maxBodyChars))
-	return lipgloss.NewStyle().PaddingTop(1).PaddingBottom(0).Render(
-		strings.Join([]string{prompt, "", box, counter}, "\n"),
+	hint := textMute.Render("ctrl+s when done · shift+tab back · esc back")
+	return lipgloss.NewStyle().PaddingTop(1).PaddingBottom(1).Render(
+		strings.Join([]string{prompt, "", box, counter, "", hint}, "\n"),
+	)
+}
+
+func renderTagsStep(m composeModel) string {
+	prompt := textBody.Render("tags — comma-separated, max 5 (lowercase, hyphens for spaces)")
+
+	// suggestions row(s) — popular tags from the whole forum, plus
+	// (when embeddings are configured) tags pulled from the 3 most
+	// semantically similar existing posts. The semantic row matters more,
+	// so it renders second (closer to the input) and uses a slightly
+	// stronger color to nudge the eye toward it.
+	chip := lipgloss.NewStyle().Foreground(colorBrand)
+
+	var suggestionsBlock []string
+	if len(m.suggestions) > 0 {
+		picks := make([]string, 0, len(m.suggestions))
+		for _, t := range m.suggestions {
+			picks = append(picks, chip.Render("#"+t))
+		}
+		suggestionsBlock = append(suggestionsBlock,
+			textDim.Render("popular tags · ")+strings.Join(picks, "  "))
+	}
+	if len(m.similarTags) > 0 {
+		similarChip := lipgloss.NewStyle().Foreground(colorBrand).Bold(true)
+		picks := make([]string, 0, len(m.similarTags))
+		for _, t := range m.similarTags {
+			picks = append(picks, similarChip.Render("#"+t))
+		}
+		suggestionsBlock = append(suggestionsBlock,
+			textDim.Render("tags from similar posts · ")+strings.Join(picks, "  "))
+	}
+	suggestions := strings.Join(suggestionsBlock, "\n")
+
+	box := formBoxFocused.Render(m.tags.View())
+
+	parsed := m.parsedTags()
+
+	counter := lipgloss.NewStyle().
+		Width(ContentWidth).Align(lipgloss.Right).Foreground(colorTextMute).
+		Render(fmt.Sprintf("%d / %d", len(parsed), maxTagsPerPost))
+
+	// "this is what your post will look like" mini-card. Built from a
+	// synthesized store.Post and rendered through the same renderPostRow
+	// the feed uses, so what you see here is byte-for-byte what readers
+	// will see (modulo selection/delete bars).
+	previewLabel := textDim.Render("preview")
+	previewRule := lipgloss.NewStyle().Foreground(colorBorder).Render(strings.Repeat("─", ContentWidth-4))
+	previewCard := renderPostRow(
+		0,
+		store.Post{
+			Title:     strings.TrimSpace(m.title.Value()),
+			Body:      strings.TrimSpace(m.body.Value()),
+			Tags:      parsed,
+			Username:  m.user.Username,
+			UserID:    m.user.ID,
+			CreatedAt: time.Now(),
+		},
+		false, // not selected
+		true,  // it's me
+		false, // not pending delete
+		false, // not compact — show body preview so writer sees what readers see
+	)
+
+	hint := textMute.Render("enter to send · shift+tab back · esc back")
+
+	return lipgloss.NewStyle().PaddingTop(1).PaddingBottom(1).Render(
+		strings.Join([]string{
+			prompt,
+			"",
+			suggestions,
+			"",
+			box,
+			counter,
+			"",
+			previewLabel,
+			previewRule,
+			previewCard,
+			previewRule,
+			"",
+			hint,
+		}, "\n"),
 	)
 }
 
@@ -452,31 +626,23 @@ func renderStatus(s, kind string) string {
 	return lipgloss.NewStyle().Width(ContentWidth).MarginTop(1).Render(styled)
 }
 
-func renderComposeFooter(step int, channelLocked bool) string {
+func renderComposeFooter(step int) string {
 	var keys []string
 	switch step {
-	case stepChannel:
+	case stepTitle:
 		keys = []string{
-			renderKey("←→", "pick"),
-			renderKey("1-9", "jump"),
 			renderKey("enter", "continue"),
 			renderKey("esc", "cancel"),
 		}
-	case stepTitle:
-		back := "shift+tab"
-		if channelLocked {
-			back = "esc"
-		}
-		keys = []string{
-			renderKey("enter", "continue"),
-			renderKey(back, "back"),
-		}
-		if !channelLocked {
-			keys = append(keys, renderKey("esc", "cancel"))
-		}
 	case stepBody:
 		keys = []string{
-			renderKey("ctrl+s", "send"),
+			renderKey("ctrl+s", "next: tags"),
+			renderKey("shift+tab", "back"),
+			renderKey("esc", "back"),
+		}
+	case stepTags:
+		keys = []string{
+			renderKey("enter", "send"),
 			renderKey("shift+tab", "back"),
 			renderKey("esc", "back"),
 		}

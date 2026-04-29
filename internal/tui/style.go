@@ -28,6 +28,11 @@ var (
 	colorBorder   = lipgloss.Color("#3A3A3A")
 	colorBorderHi = lipgloss.Color("#525252")
 	colorOk       = lipgloss.Color("#5CB88A")
+	// colorNegative — used exclusively for downvoted-score chips so brand
+	// orange can stay reserved for "your action / fresh / focused" without
+	// double-encoding as "this is bad". A muted desaturated red reads as
+	// negative without being alarming on a black terminal.
+	colorNegative = lipgloss.Color("#9F4848")
 )
 
 // === frame ===============================================================

@@ -1,73 +1,62 @@
-# Contributing to voss-ask
+# Contributing to vask
 
-VOSS rules apply: no applications, no interviews, no forms. Pick an issue,
-ship a PR, you're a contributor.
+Pick a thing, ship a PR. No interviews, no forms.
 
 ## Setup
 
 ```sh
-git clone https://github.com/voss-labs/ask
-cd ask
+git clone https://github.com/voss-labs/vask
+cd vask
 go mod tidy
 make run
 # in another shell:
 ssh -p 2300 localhost
 ```
 
-Requires Go `>= 1.22`. No CGO needed (we use the pure-Go SQLite driver).
+Requires Go `>= 1.22`. No CGO (pure-Go SQLite via `modernc.org/sqlite`).
 
-## Where to start
+For semantic search locally, drop Cloudflare Workers AI credentials into `.env` (see `.env.example`). Without them, `/` falls back to LIKE search.
 
-The v0.1 scaffold boots and shows a read-only feed. The v0.2 milestones in
-this README's roadmap are the obvious good-first-issues:
+## Where to look
 
-- [ ] Compose new letters (`internal/tui/compose.go`)
-- [ ] ♥ vote toggle on highlighted post (wire `store.ToggleHeart`)
-- [ ] Threaded replies (`internal/tui/thread.go`)
-- [ ] "maybe me" reaction
-- [ ] Auto-flag confirm dialog (already implemented in `internal/policy`,
-      needs UI in compose)
-- [ ] Search by keyword
-- [ ] Trending sort (orders by hearts in last 24h)
-
-Bigger pieces:
-
-- [ ] `ask-mod` binary (`cmd/ask-mod/main.go`) — separate port, mod
-      allowlist, hide/unhide/ban actions.
-- [ ] Live updates — pubsub channel pushes new posts to all connected
-      sessions in real time.
-- [ ] Auto-archive job: posts older than 90 days move out of the active feed.
+| package | what's in it |
+| --- | --- |
+| `cmd/vask` | SSH server entrypoint |
+| `cmd/vask-embed-backfill` | one-shot to embed historical posts |
+| `internal/auth` | ssh pubkey → sha256 fingerprint |
+| `internal/store` | libsql / sqlite layer + embedded migrations |
+| `internal/tui` | bubbletea models — splash, onboard, feed, detail, compose |
+| `internal/embed` | Cloudflare Workers AI client |
+| `internal/username` | adjective-animal handle generator |
+| `internal/ratelimit` | per-user post + comment quotas |
+| `internal/policy` | compose-time pattern checks |
 
 ## Conventions
 
-- `go fmt` everything. `make fmt` runs `gofmt -s -w .`.
-- `make vet` and `make test` must pass before opening a PR.
-- Keep packages single-purpose — `auth`, `store`, `tui`, `ratelimit`, `policy`
-  do exactly what their names say.
+- `make fmt` (`gofmt -s -w`), `make vet`, `make test` must pass before opening a PR.
+- Keep packages single-purpose. New abstraction = new package.
 - Never log SSH IPs. Never log raw public keys. Never log post content.
-- Never add a dependency without justifying it in the PR description. We
-  prefer the standard library and the existing four direct deps over
-  pulling in something new.
+- Never add a dependency without justifying it in the PR description.
+- Comments only where logic isn't self-evident. One-liners only.
+- Aim for files under 400 lines; split when growing.
+
+## Schema changes
+
+Migrations are version-gated and live in `internal/store/migrations/NNN_name.sql`. Each ends with an `INSERT OR IGNORE INTO _schema_version` row. Run order is enforced by the migrate loop.
+
+```sh
+sqlite3 vask.db '.schema'
+sqlite3 vask.db 'SELECT * FROM _schema_version;'
+```
 
 ## Code review
 
-PRs are reviewed within 48 hours. The bar is the standard VOSS bar:
-
+The bar:
 - Does it ship something?
 - Is it the simplest thing that ships it?
 - Does it preserve the privacy guarantees in the README?
 
 If yes to all three, it merges.
-
-## Running the schema migration manually
-
-The store package embeds the migration and applies it on `Open`. If you
-want to inspect the schema directly:
-
-```sh
-sqlite3 ask.db < internal/store/migrations/001_init.sql
-sqlite3 ask.db '.schema'
-```
 
 ## License
 

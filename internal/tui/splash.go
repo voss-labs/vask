@@ -43,7 +43,7 @@ func chainMark() string {
 func (m splashModel) View() string {
 	mark := chainMark()
 
-	title := brandText.Render("voss / ask")
+	title := brandText.Render("voss / vask")
 	tagline := textDim.Render("campus q&a · open source · terminal-native")
 
 	rule := lipgloss.NewStyle().
@@ -65,7 +65,7 @@ func (m splashModel) View() string {
 			"  • stay on-topic for the channel you post in.",
 	)
 
-	source := textMute.Render("audit the code: github.com/voss-labs/ask")
+	source := textMute.Render("audit the code: github.com/voss-labs/vask")
 
 	cta := textDim.Render("press ") + keyChip.Render("any key") + textDim.Render(" to continue")
 

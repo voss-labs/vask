@@ -1,14 +1,5 @@
-// Package store wraps the SQLite-compatible database with typed read/write
-// methods.
-//
-// In production we run against Turso (libsql) so the data layer is decoupled
-// from the compute layer — backend can move providers without touching data.
-// For local dev, point at a plain `file:` path and we fall back to local
-// SQLite (modernc.org/sqlite). Both speak SQLite; schema is identical;
-// the rest of the code doesn't care which one is in use.
-//
-// All identity columns hold the SHA256 hex hash of an SSH public key — never
-// the raw key, never an email, never a name.
+// Package store wraps the libsql / SQLite database with typed methods.
+// All identity columns hold sha256(pubkey); never the raw key.
 package store
 
 import (
@@ -17,28 +8,45 @@ import (
 	_ "embed"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
-	_ "github.com/tursodatabase/libsql-client-go/libsql" // libsql:// (Turso)
-	_ "modernc.org/sqlite"                                // file:./db (local dev)
+	_ "github.com/tursodatabase/libsql-client-go/libsql"
+	_ "modernc.org/sqlite"
+
+	"github.com/voss-labs/vask/internal/embed"
 )
 
 //go:embed migrations/001_init.sql
 var schema001 string
 
-// Store is a thin wrapper around *sql.DB.
+//go:embed migrations/002_unread.sql
+var schema002 string
+
+//go:embed migrations/003_tags.sql
+var schema003 string
+
+//go:embed migrations/004_username.sql
+var schema004 string
+
+//go:embed migrations/005_last_feed_at.sql
+var schema005 string
+
+//go:embed migrations/006_embedding.sql
+var schema006 string
+
 type Store struct {
-	db *sql.DB
+	db    *sql.DB
+	embed *embed.Client
 }
 
-// Open connects to a SQLite-compatible database. If url starts with libsql://,
-// https://, or wss:// it talks to a Turso instance. Otherwise the value is
-// treated as a local SQLite file path. authToken is appended to the libsql URL
-// when non-empty.
+func (s *Store) UseEmbedClient(c *embed.Client) { s.embed = c }
+func (s *Store) EmbedClient() *embed.Client     { return s.embed }
+func (s *Store) Close() error                   { return s.db.Close() }
+
 func Open(url, authToken string) (*Store, error) {
 	driver, dsn := resolveDriver(url, authToken)
-
 	db, err := sql.Open(driver, dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open %s: %w", driver, err)
@@ -46,7 +54,6 @@ func Open(url, authToken string) (*Store, error) {
 	if err := db.Ping(); err != nil {
 		return nil, fmt.Errorf("ping %s: %w", driver, err)
 	}
-
 	s := &Store{db: db}
 	if err := s.migrate(); err != nil {
 		return nil, fmt.Errorf("migrate: %w", err)
@@ -76,16 +83,52 @@ func resolveDriver(url, authToken string) (driver, dsn string) {
 	}
 }
 
-func (s *Store) Close() error { return s.db.Close() }
-
+// migration 001 always runs (idempotent CREATE TABLE IF NOT EXISTS); the
+// rest are version-gated because they include non-idempotent ALTER TABLE.
 func (s *Store) migrate() error {
-	_, err := s.db.Exec(schema001)
-	return err
+	if _, err := s.db.Exec(schema001); err != nil {
+		return fmt.Errorf("migration 001: %w", err)
+	}
+	applied, err := s.appliedVersions()
+	if err != nil {
+		return err
+	}
+	rest := []struct {
+		version int
+		sql     string
+	}{
+		{2, schema002}, {3, schema003}, {4, schema004},
+		{5, schema005}, {6, schema006},
+	}
+	for _, m := range rest {
+		if applied[m.version] {
+			continue
+		}
+		if _, err := s.db.Exec(m.sql); err != nil {
+			return fmt.Errorf("migration %03d: %w", m.version, err)
+		}
+	}
+	return nil
 }
 
-// =====================================================================
-// users
-// =====================================================================
+func (s *Store) appliedVersions() (map[int]bool, error) {
+	rows, err := s.db.Query(`SELECT version FROM _schema_version`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[int]bool{}
+	for rows.Next() {
+		var v int
+		if err := rows.Scan(&v); err != nil {
+			return nil, err
+		}
+		out[v] = true
+	}
+	return out, rows.Err()
+}
+
+// users ===============================================================
 
 type User struct {
 	ID              int64
@@ -94,6 +137,7 @@ type User struct {
 	TOSAcceptedAt   *time.Time
 	Banned          bool
 	BanReason       string
+	Username        string
 }
 
 func (s *Store) UpsertUser(ctx context.Context, fingerprint string) (*User, error) {
@@ -110,7 +154,8 @@ func (s *Store) UpsertUser(ctx context.Context, fingerprint string) (*User, erro
 
 func (s *Store) UserByFingerprint(ctx context.Context, fingerprint string) (*User, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT id, fingerprint_hash, created_at, tos_accepted_at, banned, COALESCE(ban_reason,'')
+		`SELECT id, fingerprint_hash, created_at, tos_accepted_at, banned, COALESCE(ban_reason,''),
+		        COALESCE(username,'')
 		 FROM users WHERE fingerprint_hash = ?`,
 		fingerprint,
 	)
@@ -118,7 +163,7 @@ func (s *Store) UserByFingerprint(ctx context.Context, fingerprint string) (*Use
 	var createdAt int64
 	var tos sql.NullInt64
 	var banned int
-	if err := row.Scan(&u.ID, &u.FingerprintHash, &createdAt, &tos, &banned, &u.BanReason); err != nil {
+	if err := row.Scan(&u.ID, &u.FingerprintHash, &createdAt, &tos, &banned, &u.BanReason, &u.Username); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
 		}
@@ -133,6 +178,25 @@ func (s *Store) UserByFingerprint(ctx context.Context, fingerprint string) (*Use
 	return &u, nil
 }
 
+// ClaimUsername is race-safe: the WHERE clause embeds both "no username yet"
+// and "no other row has this name", so two concurrent claimers can't both win.
+func (s *Store) ClaimUsername(ctx context.Context, userID int64, candidate string) (bool, error) {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE users SET username = ?
+		 WHERE id = ? AND username IS NULL
+		   AND NOT EXISTS (SELECT 1 FROM users WHERE username = ?)`,
+		candidate, userID, candidate,
+	)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n == 1, nil
+}
+
 func (s *Store) AcceptTOS(ctx context.Context, userID int64) error {
 	_, err := s.db.ExecContext(ctx,
 		`UPDATE users SET tos_accepted_at = ? WHERE id = ? AND tos_accepted_at IS NULL`,
@@ -141,9 +205,26 @@ func (s *Store) AcceptTOS(ctx context.Context, userID int64) error {
 	return err
 }
 
-// =====================================================================
-// channels
-// =====================================================================
+// GetAndBumpLastFeedAt returns the previous timestamp and atomically sets it
+// to "now". The previous value is the cutoff for the unread divider.
+func (s *Store) GetAndBumpLastFeedAt(ctx context.Context, userID int64) (time.Time, error) {
+	var prev sql.NullInt64
+	row := s.db.QueryRowContext(ctx, `SELECT last_feed_at FROM users WHERE id = ?`, userID)
+	if err := row.Scan(&prev); err != nil {
+		return time.Time{}, err
+	}
+	if _, err := s.db.ExecContext(ctx,
+		`UPDATE users SET last_feed_at = ? WHERE id = ?`,
+		time.Now().Unix(), userID); err != nil {
+		return time.Time{}, err
+	}
+	if !prev.Valid {
+		return time.Time{}, nil
+	}
+	return time.Unix(prev.Int64, 0), nil
+}
+
+// channels (legacy) ===================================================
 
 type Channel struct {
 	Slug        string
@@ -153,7 +234,6 @@ type Channel struct {
 	PostCount   int
 }
 
-// ListChannels returns all channels sorted by sort_order, with cached post counts.
 func (s *Store) ListChannels(ctx context.Context) ([]Channel, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT c.slug, c.name, c.description, c.sort_order,
@@ -190,27 +270,26 @@ func (s *Store) GetChannel(ctx context.Context, slug string) (*Channel, error) {
 	return &c, nil
 }
 
-// =====================================================================
-// posts
-// =====================================================================
+// posts ===============================================================
 
-// Post is the public-facing row. Hidden + Reports are zero in the public
-// Feed query and only populated by admin queries.
 type Post struct {
 	ID           int64
 	UserID       int64
+	Username     string
 	Channel      string
 	Title        string
 	Body         string
 	CreatedAt    time.Time
-	Score        int   // sum(post_votes.value)
-	MyVote       int   // -1, 0, +1 — the calling user's current vote
-	CommentCount int   // count of non-hidden comments
-	Hidden       bool  // admin only
-	Reports      int   // admin only
+	Score        int
+	MyVote       int
+	RecentScore  int
+	CommentCount int
+	HasUnread    bool
+	Tags         []string
+	Hidden       bool
+	Reports      int
 }
 
-// SortMode controls ListPosts ordering.
 type SortMode int
 
 const (
@@ -219,49 +298,214 @@ const (
 	SortTop
 )
 
-// ListPosts returns posts in the chosen channel (empty string = all channels).
-// myUserID is used to populate Post.MyVote — pass 0 for unauthenticated.
-func (s *Store) ListPosts(ctx context.Context, channel string, sort SortMode, limit int, myUserID int64) ([]Post, error) {
-	if limit <= 0 || limit > 200 {
-		limit = 50
+type ListPostsParams struct {
+	Tag      string
+	Query    string
+	MineOnly bool
+	Sort     SortMode
+	Limit    int
+	Offset   int
+}
+
+func (s *Store) ListPosts(ctx context.Context, myUserID int64, params ListPostsParams) ([]Post, error) {
+	limit := params.Limit
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	offset := params.Offset
+	if offset < 0 {
+		offset = 0
 	}
 
-	orderBy := postOrderBy(sort)
-
-	var args []any
-	args = append(args, myUserID) // for my_vote LEFT JOIN
-	q := `
-		SELECT p.id, p.user_id, p.channel, p.title, p.body, p.created_at,
-		       COALESCE((SELECT SUM(value) FROM post_votes WHERE post_id = p.id), 0)        AS score,
-		       COALESCE((SELECT value      FROM post_votes WHERE post_id = p.id AND user_id = ?), 0) AS my_vote,
-		       (SELECT COUNT(*) FROM comments WHERE post_id = p.id AND hidden = 0)           AS comments
+	args := []any{myUserID, myUserID}
+	q := postSelectColumns + `
 		FROM posts p
+		LEFT JOIN users u ON u.id = p.user_id
 		WHERE p.hidden = 0`
-	if channel != "" {
-		q += ` AND p.channel = ?`
-		args = append(args, channel)
-	}
-	q += ` ORDER BY ` + orderBy + ` LIMIT ?`
-	args = append(args, limit)
 
-	rows, err := s.db.QueryContext(ctx, q, args...)
+	if params.Tag != "" {
+		q += ` AND EXISTS (SELECT 1 FROM post_tags WHERE post_id = p.id AND tag = ?)`
+		args = append(args, params.Tag)
+	}
+	if params.Query != "" {
+		needle := "%" + strings.ToLower(params.Query) + "%"
+		q += ` AND (lower(p.title) LIKE ? OR lower(p.body) LIKE ?)`
+		args = append(args, needle, needle)
+	}
+	if params.MineOnly {
+		q += ` AND p.user_id = ?`
+		args = append(args, myUserID)
+	}
+
+	q += ` ORDER BY ` + postOrderBy(params.Sort) + ` LIMIT ? OFFSET ?`
+	args = append(args, limit, offset)
+
+	return scanPosts(s.db.QueryContext(ctx, q, args...))
+}
+
+// SearchPostsSemantic embeds the query and ranks by cosine distance.
+// Falls back to LIKE silently on any failure (no embed client, embed call,
+// SQL — local SQLite doesn't have vector_distance_cos).
+func (s *Store) SearchPostsSemantic(ctx context.Context, myUserID int64, query string, params ListPostsParams) ([]Post, error) {
+	if s.embed != nil {
+		v, err := s.embed.Embed(ctx, query)
+		if err == nil {
+			semanticParams := params
+			semanticParams.Query = ""
+			posts, qerr := s.listPostsByVector(ctx, myUserID, v, semanticParams)
+			if qerr == nil {
+				return posts, nil
+			}
+			slog.Warn("semantic search failed; LIKE fallback", "err", qerr)
+		} else {
+			slog.Warn("embed query failed; LIKE fallback", "err", err)
+		}
+	}
+	likeParams := params
+	if likeParams.Query == "" {
+		likeParams.Query = query
+	}
+	return s.ListPosts(ctx, myUserID, likeParams)
+}
+
+func (s *Store) listPostsByVector(ctx context.Context, myUserID int64, v []float32, params ListPostsParams) ([]Post, error) {
+	limit := params.Limit
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	offset := params.Offset
+	if offset < 0 {
+		offset = 0
+	}
+
+	args := []any{embed.Format(v), myUserID, myUserID}
+	q := postSelectColumns + `
+		FROM posts p
+		LEFT JOIN users u ON u.id = p.user_id
+		WHERE p.hidden = 0 AND p.embedding IS NOT NULL`
+
+	if params.Tag != "" {
+		q += ` AND EXISTS (SELECT 1 FROM post_tags WHERE post_id = p.id AND tag = ?)`
+		args = append(args, params.Tag)
+	}
+	if params.MineOnly {
+		q += ` AND p.user_id = ?`
+		args = append(args, myUserID)
+	}
+
+	q += ` ORDER BY vector_distance_cos(p.embedding, vector(?1)) LIMIT ? OFFSET ?`
+	args = append(args, limit, offset)
+
+	return scanPosts(s.db.QueryContext(ctx, q, args...))
+}
+
+func (s *Store) NearestPostsToPost(ctx context.Context, postID int64, limit int) ([]Post, error) {
+	if limit <= 0 || limit > 20 {
+		limit = 3
+	}
+	var srcBlob []byte
+	row := s.db.QueryRowContext(ctx, `SELECT embedding FROM posts WHERE id = ?`, postID)
+	if err := row.Scan(&srcBlob); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if len(srcBlob) == 0 {
+		return nil, nil
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT p.id, p.user_id, COALESCE(u.username, ''), p.title, p.created_at,
+		       COALESCE((SELECT SUM(value) FROM post_votes WHERE post_id = p.id), 0),
+		       COALESCE((SELECT GROUP_CONCAT(tag, ',') FROM post_tags WHERE post_id = p.id), '')
+		FROM posts p
+		LEFT JOIN users u ON u.id = p.user_id
+		WHERE p.id != ? AND p.hidden = 0 AND p.embedding IS NOT NULL
+		ORDER BY vector_distance_cos(p.embedding, ?)
+		LIMIT ?`, postID, srcBlob, limit)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-
-	out := make([]Post, 0, limit)
+	var out []Post
 	for rows.Next() {
 		var p Post
 		var createdAt int64
-		if err := rows.Scan(&p.ID, &p.UserID, &p.Channel, &p.Title, &p.Body, &createdAt,
-			&p.Score, &p.MyVote, &p.CommentCount); err != nil {
+		var tagsCSV string
+		if err := rows.Scan(&p.ID, &p.UserID, &p.Username, &p.Title, &createdAt, &p.Score, &tagsCSV); err != nil {
 			return nil, err
 		}
 		p.CreatedAt = time.Unix(createdAt, 0)
+		p.Tags = splitCSV(tagsCSV)
 		out = append(out, p)
 	}
 	return out, rows.Err()
+}
+
+func (s *Store) NearestPostsByVector(ctx context.Context, v []float32, limit int) ([]Post, error) {
+	if limit <= 0 || limit > 20 {
+		limit = 3
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT p.id, p.title,
+		       COALESCE((SELECT GROUP_CONCAT(tag, ',') FROM post_tags WHERE post_id = p.id), '')
+		FROM posts p
+		WHERE p.hidden = 0 AND p.embedding IS NOT NULL
+		ORDER BY vector_distance_cos(p.embedding, vector(?))
+		LIMIT ?`, embed.Format(v), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Post
+	for rows.Next() {
+		var p Post
+		var tagsCSV string
+		if err := rows.Scan(&p.ID, &p.Title, &tagsCSV); err != nil {
+			return nil, err
+		}
+		p.Tags = splitCSV(tagsCSV)
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) HasEmbeddings(ctx context.Context) (bool, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM posts WHERE embedding IS NOT NULL`).Scan(&n)
+	return n > 0, err
+}
+
+func (s *Store) CountPosts(ctx context.Context, myUserID int64, params ListPostsParams) (int, error) {
+	q := `SELECT COUNT(*) FROM posts p WHERE p.hidden = 0`
+	var args []any
+	if params.Tag != "" {
+		q += ` AND EXISTS (SELECT 1 FROM post_tags WHERE post_id = p.id AND tag = ?)`
+		args = append(args, params.Tag)
+	}
+	if params.Query != "" {
+		needle := "%" + strings.ToLower(params.Query) + "%"
+		q += ` AND (lower(p.title) LIKE ? OR lower(p.body) LIKE ?)`
+		args = append(args, needle, needle)
+	}
+	if params.MineOnly {
+		q += ` AND p.user_id = ?`
+		args = append(args, myUserID)
+	}
+	var n int
+	if err := s.db.QueryRowContext(ctx, q, args...).Scan(&n); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+func (s *Store) MarkPostSeen(ctx context.Context, userID, postID int64) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO post_views(user_id, post_id, last_seen_at) VALUES (?, ?, ?)
+		 ON CONFLICT(user_id, post_id) DO UPDATE SET last_seen_at = excluded.last_seen_at`,
+		userID, postID, time.Now().Unix())
+	return err
 }
 
 func postOrderBy(sort SortMode) string {
@@ -270,10 +514,8 @@ func postOrderBy(sort SortMode) string {
 		return "p.created_at DESC, p.id DESC"
 	case SortTop:
 		return "score DESC, p.created_at DESC"
-	case SortHot:
-		fallthrough
 	default:
-		// HN-style: score / (hours_old + 2)^1.8
+		// HN ranking: score / (hours_old + 2)^1.8
 		return `(
 			COALESCE((SELECT SUM(value) FROM post_votes WHERE post_id = p.id), 0)
 			/ POWER(((strftime('%s','now') - p.created_at) / 3600.0) + 2.0, 1.8)
@@ -281,22 +523,24 @@ func postOrderBy(sort SortMode) string {
 	}
 }
 
-// GetPost returns a single post including the calling user's vote, or nil if
-// not found or hidden (when myUserID isn't a moderator). Pass 0 for myUserID
-// if anonymous.
 func (s *Store) GetPost(ctx context.Context, postID, myUserID int64) (*Post, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT p.id, p.user_id, p.channel, p.title, p.body, p.created_at, p.hidden, p.reports,
+		SELECT p.id, p.user_id, COALESCE(u.username, ''),
+		       p.channel, p.title, p.body, p.created_at, p.hidden, p.reports,
 		       COALESCE((SELECT SUM(value) FROM post_votes WHERE post_id = p.id), 0),
 		       COALESCE((SELECT value FROM post_votes WHERE post_id = p.id AND user_id = ?), 0),
-		       (SELECT COUNT(*) FROM comments WHERE post_id = p.id AND hidden = 0)
-		FROM posts p WHERE p.id = ?`, myUserID, postID)
+		       (SELECT COUNT(*) FROM comments WHERE post_id = p.id AND hidden = 0),
+		       COALESCE((SELECT GROUP_CONCAT(tag, ',') FROM post_tags WHERE post_id = p.id), '')
+		FROM posts p
+		LEFT JOIN users u ON u.id = p.user_id
+		WHERE p.id = ?`, myUserID, postID)
 
 	var p Post
 	var createdAt int64
 	var hidden int
-	if err := row.Scan(&p.ID, &p.UserID, &p.Channel, &p.Title, &p.Body, &createdAt, &hidden, &p.Reports,
-		&p.Score, &p.MyVote, &p.CommentCount); err != nil {
+	var tagsCSV string
+	if err := row.Scan(&p.ID, &p.UserID, &p.Username, &p.Channel, &p.Title, &p.Body, &createdAt, &hidden, &p.Reports,
+		&p.Score, &p.MyVote, &p.CommentCount, &tagsCSV); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
 		}
@@ -304,27 +548,155 @@ func (s *Store) GetPost(ctx context.Context, postID, myUserID int64) (*Post, err
 	}
 	p.CreatedAt = time.Unix(createdAt, 0)
 	p.Hidden = hidden == 1
+	p.Tags = splitCSV(tagsCSV)
 	if p.Hidden {
-		// public callers shouldn't see hidden posts
 		return nil, nil
 	}
 	return &p, nil
 }
 
-// CreatePost inserts a new post and returns its id.
-func (s *Store) CreatePost(ctx context.Context, userID int64, channel, title, body string) (int64, error) {
-	res, err := s.db.ExecContext(ctx,
+func (s *Store) CreatePost(ctx context.Context, userID int64, title, body string, tags []string) (int64, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	now := time.Now().Unix()
+	res, err := tx.ExecContext(ctx,
 		`INSERT INTO posts(user_id, channel, title, body, created_at)
-		 VALUES (?, ?, ?, ?, ?)`,
-		userID, channel, title, body, time.Now().Unix(),
+		 VALUES (?, 'general', ?, ?, ?)`,
+		userID, title, body, now,
 	)
 	if err != nil {
 		return 0, err
 	}
-	return res.LastInsertId()
+	postID, err := res.LastInsertId()
+	if err != nil {
+		return 0, err
+	}
+	for _, t := range tags {
+		t = NormalizeTag(t)
+		if t == "" {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx,
+			`INSERT OR IGNORE INTO post_tags(post_id, tag, created_at) VALUES (?, ?, ?)`,
+			postID, t, now,
+		); err != nil {
+			return 0, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+
+	// fire-and-forget: post is durable; embedding is best-effort
+	if s.embed != nil {
+		go s.embedAndSavePost(postID, title, body)
+	}
+	return postID, nil
 }
 
-// CountUserPostsSince — for the per-user post-rate limiter.
+func (s *Store) embedAndSavePost(postID int64, title, body string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	defer cancel()
+	v, err := s.embed.Embed(ctx, title+"\n\n"+body)
+	if err != nil {
+		slog.Warn("embed post", "post_id", postID, "err", err)
+		return
+	}
+	if _, err := s.db.ExecContext(ctx,
+		`UPDATE posts SET embedding = ? WHERE id = ?`,
+		embed.Pack(v), postID); err != nil {
+		slog.Warn("embed update", "post_id", postID, "err", err)
+	}
+}
+
+// EmbedAndSavePost is the exported variant for cmd/vask-embed-backfill.
+func (s *Store) EmbedAndSavePost(postID int64, title, body string) {
+	s.embedAndSavePost(postID, title, body)
+}
+
+func (s *Store) PostsMissingEmbedding(ctx context.Context, limit int) ([]Post, error) {
+	if limit <= 0 || limit > 1000 {
+		limit = 100
+	}
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, title, body FROM posts WHERE embedding IS NULL AND hidden = 0 ORDER BY id LIMIT ?`,
+		limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Post
+	for rows.Next() {
+		var p Post
+		if err := rows.Scan(&p.ID, &p.Title, &p.Body); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) ListPopularTags(ctx context.Context, limit int) ([]string, error) {
+	if limit <= 0 || limit > 50 {
+		limit = 12
+	}
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT tag FROM post_tags GROUP BY tag ORDER BY COUNT(*) DESC, tag ASC LIMIT ?`,
+		limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var t string
+		if err := rows.Scan(&t); err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+// NormalizeTag: lowercase, trim, spaces→hyphens, max 24 chars, [a-z0-9-_].
+func NormalizeTag(t string) string {
+	t = strings.ToLower(strings.TrimSpace(t))
+	t = strings.ReplaceAll(t, " ", "-")
+	var b strings.Builder
+	for _, r := range t {
+		switch {
+		case r >= 'a' && r <= 'z',
+			r >= '0' && r <= '9',
+			r == '-' || r == '_':
+			b.WriteRune(r)
+		}
+	}
+	out := b.String()
+	if len(out) > 24 {
+		out = out[:24]
+	}
+	return out
+}
+
+func splitCSV(s string) []string {
+	if s == "" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
 func (s *Store) CountUserPostsSince(ctx context.Context, userID int64, since time.Time) (int, error) {
 	row := s.db.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM posts WHERE user_id = ? AND created_at >= ?`,
@@ -336,11 +708,21 @@ func (s *Store) CountUserPostsSince(ctx context.Context, userID int64, since tim
 	return n, nil
 }
 
-// SetPostVote sets the user's vote to value (-1, 0, or +1). 0 = remove vote.
-// Returns the new score.
+// ErrSelfVote: enforced at the store layer so score reflects others' opinion,
+// not author's. Important in small communities where one self-vote is a
+// meaningful percentage of total signal.
+var ErrSelfVote = errors.New("can't vote on your own contribution")
+
 func (s *Store) SetPostVote(ctx context.Context, userID, postID int64, value int) (int, error) {
 	if value != -1 && value != 0 && value != 1 {
 		return 0, fmt.Errorf("invalid vote value: %d", value)
+	}
+	authorID, err := s.AuthorOfPost(ctx, postID)
+	if err != nil {
+		return 0, err
+	}
+	if authorID == userID {
+		return 0, ErrSelfVote
 	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -377,9 +759,6 @@ func (s *Store) SetPostVote(ctx context.Context, userID, postID int64, value int
 	return score, nil
 }
 
-// DeleteOwnPost deletes a post the calling user authored, plus all dependent
-// rows (votes, comments + comment votes) — in a single transaction. Strictly
-// enforced at the SQL level.
 func (s *Store) DeleteOwnPost(ctx context.Context, userID, postID int64) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -392,34 +771,31 @@ func (s *Store) DeleteOwnPost(ctx context.Context, userID, postID int64) error {
 	if err := row.Scan(&x); err != nil {
 		return err
 	}
-
-	// delete comment votes for any comment under this post, then comments, then post-related rows
-	if _, err := tx.ExecContext(ctx,
+	stmts := []string{
 		`DELETE FROM comment_votes WHERE comment_id IN (SELECT id FROM comments WHERE post_id = ?)`,
-		postID); err != nil {
-		return err
+		`DELETE FROM comments      WHERE post_id = ?`,
+		`DELETE FROM post_votes    WHERE post_id = ?`,
+		`DELETE FROM post_tags     WHERE post_id = ?`,
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM comments   WHERE post_id = ?`, postID); err != nil {
-		return err
+	for _, q := range stmts {
+		if _, err := tx.ExecContext(ctx, q, postID); err != nil {
+			return err
+		}
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM post_votes WHERE post_id = ?`, postID); err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM posts      WHERE id = ? AND user_id = ?`, postID, userID); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM posts WHERE id = ? AND user_id = ?`, postID, userID); err != nil {
 		return err
 	}
 	return tx.Commit()
 }
 
-// =====================================================================
-// comments (thread tree)
-// =====================================================================
+// comments ============================================================
 
 type Comment struct {
 	ID              int64
 	PostID          int64
-	ParentCommentID *int64 // nil = top-level
+	ParentCommentID *int64
 	UserID          int64
+	Username        string
 	Body            string
 	CreatedAt       time.Time
 	Score           int
@@ -427,14 +803,15 @@ type Comment struct {
 	Hidden          bool
 }
 
-// ListComments returns all comments under a post ordered by created_at,
-// flat (caller assembles the tree using ParentCommentID).
 func (s *Store) ListComments(ctx context.Context, postID, myUserID int64) ([]Comment, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT c.id, c.post_id, c.parent_comment_id, c.user_id, c.body, c.created_at, c.hidden,
+		SELECT c.id, c.post_id, c.parent_comment_id, c.user_id,
+		       COALESCE(u.username, ''),
+		       c.body, c.created_at, c.hidden,
 		       COALESCE((SELECT SUM(value) FROM comment_votes WHERE comment_id = c.id), 0),
 		       COALESCE((SELECT value      FROM comment_votes WHERE comment_id = c.id AND user_id = ?), 0)
 		FROM comments c
+		LEFT JOIN users u ON u.id = c.user_id
 		WHERE c.post_id = ?
 		ORDER BY c.created_at ASC, c.id ASC`,
 		myUserID, postID)
@@ -449,7 +826,7 @@ func (s *Store) ListComments(ctx context.Context, postID, myUserID int64) ([]Com
 		var parent sql.NullInt64
 		var createdAt int64
 		var hidden int
-		if err := rows.Scan(&c.ID, &c.PostID, &parent, &c.UserID, &c.Body, &createdAt, &hidden,
+		if err := rows.Scan(&c.ID, &c.PostID, &parent, &c.UserID, &c.Username, &c.Body, &createdAt, &hidden,
 			&c.Score, &c.MyVote); err != nil {
 			return nil, err
 		}
@@ -464,7 +841,6 @@ func (s *Store) ListComments(ctx context.Context, postID, myUserID int64) ([]Com
 	return out, rows.Err()
 }
 
-// CreateComment adds a top-level (parent=nil) or threaded reply.
 func (s *Store) CreateComment(ctx context.Context, userID, postID int64, parentCommentID *int64, body string) (int64, error) {
 	res, err := s.db.ExecContext(ctx,
 		`INSERT INTO comments(post_id, parent_comment_id, user_id, body, created_at)
@@ -477,10 +853,16 @@ func (s *Store) CreateComment(ctx context.Context, userID, postID int64, parentC
 	return res.LastInsertId()
 }
 
-// SetCommentVote — same semantics as SetPostVote.
 func (s *Store) SetCommentVote(ctx context.Context, userID, commentID int64, value int) (int, error) {
 	if value != -1 && value != 0 && value != 1 {
 		return 0, fmt.Errorf("invalid vote value: %d", value)
+	}
+	authorID, err := s.AuthorOfComment(ctx, commentID)
+	if err != nil {
+		return 0, err
+	}
+	if authorID == userID {
+		return 0, ErrSelfVote
 	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -517,9 +899,8 @@ func (s *Store) SetCommentVote(ctx context.Context, userID, commentID int64, val
 	return score, nil
 }
 
-// DeleteOwnComment — strictly own comments. Cascades to comment_votes and
-// any nested replies (set their parent to NULL so they orphan up rather than
-// disappearing — keeps thread context intact).
+// DeleteOwnComment orphans children up to the parent (sets their parent to
+// NULL) so thread context survives.
 func (s *Store) DeleteOwnComment(ctx context.Context, userID, commentID int64) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -532,7 +913,6 @@ func (s *Store) DeleteOwnComment(ctx context.Context, userID, commentID int64) e
 	if err := row.Scan(&x); err != nil {
 		return err
 	}
-
 	if _, err := tx.ExecContext(ctx,
 		`UPDATE comments SET parent_comment_id = NULL WHERE parent_comment_id = ?`, commentID); err != nil {
 		return err
@@ -548,9 +928,54 @@ func (s *Store) DeleteOwnComment(ctx context.Context, userID, commentID int64) e
 	return tx.Commit()
 }
 
-// =====================================================================
-// moderator-only queries (used by cmd/ask-mod)
-// =====================================================================
+type ActivityComment struct {
+	Comment   Comment
+	PostTitle string
+}
+
+func (s *Store) MyRecentComments(ctx context.Context, userID int64, limit int) ([]ActivityComment, error) {
+	if limit <= 0 || limit > 50 {
+		limit = 10
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT c.id, c.post_id, c.user_id, c.body, c.created_at,
+		       COALESCE(p.title, '')
+		FROM comments c
+		JOIN posts p ON p.id = c.post_id
+		WHERE c.user_id = ? AND c.hidden = 0 AND p.hidden = 0
+		ORDER BY c.created_at DESC
+		LIMIT ?`, userID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []ActivityComment
+	for rows.Next() {
+		var ac ActivityComment
+		var createdAt int64
+		if err := rows.Scan(&ac.Comment.ID, &ac.Comment.PostID, &ac.Comment.UserID,
+			&ac.Comment.Body, &createdAt, &ac.PostTitle); err != nil {
+			return nil, err
+		}
+		ac.Comment.CreatedAt = time.Unix(createdAt, 0)
+		out = append(out, ac)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) CountUserCommentsSince(ctx context.Context, userID int64, since time.Time) (int, error) {
+	row := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM comments WHERE user_id = ? AND created_at >= ?`,
+		userID, since.Unix())
+	var n int
+	if err := row.Scan(&n); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+// moderation ==========================================================
 
 func (s *Store) ListPostsAdmin(ctx context.Context, channel string, includeHidden bool, limit int) ([]Post, error) {
 	if limit <= 0 || limit > 500 {
@@ -621,6 +1046,18 @@ func (s *Store) UnhideComment(ctx context.Context, id int64) error {
 
 func (s *Store) AuthorOfPost(ctx context.Context, postID int64) (int64, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT user_id FROM posts WHERE id = ?`, postID)
+	var uid int64
+	if err := row.Scan(&uid); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	return uid, nil
+}
+
+func (s *Store) AuthorOfComment(ctx context.Context, commentID int64) (int64, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT user_id FROM comments WHERE id = ?`, commentID)
 	var uid int64
 	if err := row.Scan(&uid); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -718,9 +1155,46 @@ func (s *Store) ModActions(ctx context.Context, limit int) ([]ModAction, error) 
 	return out, rows.Err()
 }
 
-// =====================================================================
-// helpers
-// =====================================================================
+// helpers =============================================================
+
+const postSelectColumns = `
+	SELECT p.id, p.user_id, COALESCE(u.username, '') AS username,
+	       p.channel, p.title, p.body, p.created_at,
+	       COALESCE((SELECT SUM(value) FROM post_votes WHERE post_id = p.id), 0)        AS score,
+	       COALESCE((SELECT value      FROM post_votes WHERE post_id = p.id AND user_id = ?), 0) AS my_vote,
+	       COALESCE((SELECT SUM(value) FROM post_votes
+	                  WHERE post_id = p.id
+	                    AND created_at >= strftime('%s','now') - 3600), 0)              AS recent_score,
+	       (SELECT COUNT(*) FROM comments WHERE post_id = p.id AND hidden = 0)           AS comments,
+	       CASE
+	         WHEN (SELECT MAX(created_at) FROM comments WHERE post_id = p.id AND hidden = 0)
+	              > COALESCE((SELECT last_seen_at FROM post_views WHERE post_id = p.id AND user_id = ?), 0)
+	         THEN 1 ELSE 0
+	       END AS has_unread,
+	       COALESCE((SELECT GROUP_CONCAT(tag, ',') FROM post_tags WHERE post_id = p.id), '') AS tags`
+
+func scanPosts(rows *sql.Rows, err error) ([]Post, error) {
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Post
+	for rows.Next() {
+		var p Post
+		var createdAt int64
+		var unread int
+		var tagsCSV string
+		if err := rows.Scan(&p.ID, &p.UserID, &p.Username, &p.Channel, &p.Title, &p.Body, &createdAt,
+			&p.Score, &p.MyVote, &p.RecentScore, &p.CommentCount, &unread, &tagsCSV); err != nil {
+			return nil, err
+		}
+		p.CreatedAt = time.Unix(createdAt, 0)
+		p.HasUnread = unread == 1
+		p.Tags = splitCSV(tagsCSV)
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
 
 func nullify(s string) sql.NullString {
 	if s == "" {

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# verify-deploy.sh — end-to-end diagnostic for voss-ask on Oracle.
+# verify-deploy.sh — end-to-end diagnostic for vosslabs/vask on Oracle.
 #
 # Walks every layer in order:
 #   1. management ssh (port 22)              — proves VM is reachable at all
@@ -63,23 +63,23 @@ fi
 
 step "2/5  systemd service"
 # is-active returns non-zero for inactive states, so swallow the exit and just keep stdout.
-status=$(ssh "${SSH_OPTS[@]}" "$SSH_TARGET" 'systemctl is-active ask; true' 2>/dev/null | tr -d '[:space:]')
+status=$(ssh "${SSH_OPTS[@]}" "$SSH_TARGET" 'systemctl is-active vask; true' 2>/dev/null | tr -d '[:space:]')
 case "$status" in
     active)
-        pass "ask.service is active"
+        pass "vask.service is active"
         ;;
     inactive|failed|activating|deactivating)
-        fail "ask.service is $status"
-        note "→ tail journal: ssh -p $SSH_PORT $SSH_TARGET sudo journalctl -u ask -n 50"
-        note "→ try restart:  ssh -p $SSH_PORT $SSH_TARGET sudo systemctl restart ask"
+        fail "vask.service is $status"
+        note "→ tail journal: ssh -p $SSH_PORT $SSH_TARGET sudo journalctl -u vask -n 50"
+        note "→ try restart:  ssh -p $SSH_PORT $SSH_TARGET sudo systemctl restart vask"
         mark_fail
         ;;
     "")
-        fail "could not query ask.service (ssh may have failed)"
+        fail "could not query vask.service (ssh may have failed)"
         mark_fail
         ;;
     *)
-        fail "ask.service unexpected status: '$status'"
+        fail "vask.service unexpected status: '$status'"
         mark_fail
         ;;
 esac
@@ -94,7 +94,7 @@ if [[ -n "$listen" ]]; then
 else
     fail "nothing listening on tcp/$PORT inside the VM"
     note "→ the binary may have crashed during startup."
-    note "→ tail logs: ssh $SSH_TARGET sudo journalctl -u ask -n 50"
+    note "→ tail logs: ssh $SSH_TARGET sudo journalctl -u vask -n 50"
     mark_fail
 fi
 

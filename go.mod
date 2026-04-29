@@ -1,4 +1,4 @@
-module github.com/voss-labs/ask
+module github.com/voss-labs/vask
 
 go 1.24.2
 

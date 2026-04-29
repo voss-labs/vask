@@ -1,14 +1,4 @@
-// Command ask is the SSH server for VOSS Ask — the campus q&a / forum.
-//
-// On each accepted SSH session:
-//  1. The connected pubkey's fingerprint hash becomes the user identity.
-//  2. We upsert the user row in the database.
-//  3. We spawn a bubbletea program that drives the TUI for that session.
-//
-// Local dev:   go run ./cmd/ask
-//              ssh -p 2300 localhost
-//
-// Production binds port 22 with CAP_NET_BIND_SERVICE; see deploy/ask.service.
+// Command vask is the SSH server.
 package main
 
 import (
@@ -32,9 +22,10 @@ import (
 	"github.com/charmbracelet/wish/logging"
 	"github.com/muesli/termenv"
 
-	"github.com/voss-labs/ask/internal/auth"
-	"github.com/voss-labs/ask/internal/store"
-	"github.com/voss-labs/ask/internal/tui"
+	"github.com/voss-labs/vask/internal/auth"
+	"github.com/voss-labs/vask/internal/embed"
+	"github.com/voss-labs/vask/internal/store"
+	"github.com/voss-labs/vask/internal/tui"
 )
 
 // Force truecolor escape codes regardless of the host TERM.
@@ -74,6 +65,17 @@ func main() {
 	}
 	defer st.Close()
 	slog.Info("store ready", "mode", mode, "target", redact(dbTarget))
+
+	// Optional Cloudflare-backed embedding client. FromEnv returns nil if
+	// CF_ACCOUNT_ID / CF_AI_TOKEN aren't set, in which case CreatePost
+	// will skip the embedding side-effect and posts are stored without
+	// vectors — fine for local dev and any deploy that hasn't enabled it.
+	if ec := embed.FromEnv(); ec != nil {
+		st.UseEmbedClient(ec)
+		slog.Info("embeddings enabled", "model", "@cf/baai/bge-m3", "dims", embed.VectorDim)
+	} else {
+		slog.Info("embeddings disabled", "reason", "CF_ACCOUNT_ID/CF_AI_TOKEN not set")
+	}
 
 	srv, err := wish.NewServer(
 		wish.WithAddress(net.JoinHostPort(*host, *port)),

@@ -1,33 +1,60 @@
 #!/usr/bin/env bash
-# setup-oracle.sh — provision and deploy voss-ask to an Oracle Cloud VM.
+# setup-oracle.sh — provision and deploy vosslabs/vask to an Oracle Cloud VM.
+#
+# Secrets come from a .env file, never from shell args/history. Default
+# lookup order: ./.env, ./.env.local, ../.env (relative to repo root).
+# Override with --env-file PATH.
 #
 # Usage:
-#   ./deploy/setup-oracle.sh                  full deploy (bootstrap + push + start)
-#   ./deploy/setup-oracle.sh --update         skip bootstrap, just rebuild + restart
-#   ./deploy/setup-oracle.sh --rotate-token   re-push turso.env, restart
-#   ./deploy/setup-oracle.sh --help           this message
+#   ./deploy/setup-oracle.sh                            full deploy
+#   ./deploy/setup-oracle.sh --update                   rebuild + restart only
+#   ./deploy/setup-oracle.sh --rotate-token             re-push env, restart
+#   ./deploy/setup-oracle.sh --env-file path/to/.env    custom env file
+#   ./deploy/setup-oracle.sh --help                     this message
 #
-# Required env (override defaults by exporting):
-#   VM_IP               default: 129.153.206.68
-#   SSH_KEY             default: ~/.ssh/oracle-ask.key
-#   SSH_USER            default: ubuntu
-#   TURSO_DATABASE_URL  required for first deploy and --rotate-token
-#   TURSO_AUTH_TOKEN    required for first deploy and --rotate-token
+# Override deploy targets via env (VM_IP, SSH_KEY, SSH_USER, SSH_PORT).
 #
-# Prerequisites (do these once, manually):
+# Required keys in .env:
+#   TURSO_DATABASE_URL   libsql://… for the production DB
+#   TURSO_AUTH_TOKEN     long-lived token for that DB
+#
+# Optional keys in .env (enables embeddings):
+#   CF_ACCOUNT_ID        Cloudflare account ID (Workers & Pages → sidebar)
+#   CF_AI_TOKEN          Workers AI scoped token
+#
+# Secret-handling rules (do not violate):
+#   - No secret value is ever printed to stdout / stderr / journal.
+#   - Secrets are sent over SSH via heredoc on stdin, never as command
+#     arguments — they don't appear in `ps` on the VM.
+#   - The remote env file is mode 0600, owned by vask:vask.
+#
+# Prerequisites (one-time, manual):
 #   1. Oracle VCN security list — allow inbound TCP 2200 from 0.0.0.0/0
 #   2. Turso DB created at app.turso.tech
-#   3. Turso token issued: turso db tokens create voss-ask-harshalmore31 --expiration none
+#   3. Turso token issued: turso db tokens create vosslabs/vask-… --expiration none
 #   4. Go installed locally (brew install go)
+#   5. cp .env.example .env  &&  fill in values  &&  chmod 600 .env
 
 set -euo pipefail
 
 # ===== config ==========================================================
 
 VM_IP="${VM_IP:-129.153.206.68}"
-SSH_KEY="${SSH_KEY:-$HOME/.ssh/oracle-ask.key}"
 SSH_USER="${SSH_USER:-ubuntu}"
 SSH_PORT="${SSH_PORT:-22000}"   # management ssh — moved off 22 to free that port for ask
+
+if [[ -z "${SSH_KEY:-}" ]]; then
+    for candidate in \
+        "$HOME/.ssh/oracle-ask.key" \
+        "$HOME/.ssh/oracle.key" \
+        "$HOME/.ssh/voss.key"; do
+        if [[ -f "$candidate" ]]; then
+            SSH_KEY="$candidate"
+            break
+        fi
+    done
+fi
+SSH_KEY="${SSH_KEY:-$HOME/.ssh/oracle-ask.key}"
 SSH_TARGET="$SSH_USER@$VM_IP"
 # ssh and scp disagree on the port flag (-p lowercase vs -P uppercase). Keep separate.
 SSH_OPTS=(-i "$SSH_KEY" -p "$SSH_PORT" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new)
@@ -35,23 +62,34 @@ SCP_OPTS=(-i "$SSH_KEY" -P "$SSH_PORT" -o IdentitiesOnly=yes -o StrictHostKeyChe
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MODE="full"
+ENV_FILE=""
 
 # ===== arg parse =======================================================
 
-for arg in "$@"; do
-    case "$arg" in
-        --update) MODE="update" ;;
-        --rotate-token) MODE="rotate" ;;
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --update)        MODE="update"; shift ;;
+        --rotate-token)  MODE="rotate"; shift ;;
+        --env-file=*)    ENV_FILE="${1#*=}"; shift ;;
+        --env-file)      shift; ENV_FILE="${1:-}"; shift ;;
         --help|-h)
             sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'
             exit 0
             ;;
         *)
-            echo "unknown flag: $arg (try --help)" >&2
+            echo "unknown flag: $1 (try --help)" >&2
             exit 2
             ;;
     esac
 done
+
+# Default env-file lookup: in-repo .env, then .env.local, then parent .env.
+if [[ -z "$ENV_FILE" ]]; then
+    if   [[ -f "$REPO_ROOT/.env"        ]]; then ENV_FILE="$REPO_ROOT/.env"
+    elif [[ -f "$REPO_ROOT/.env.local"  ]]; then ENV_FILE="$REPO_ROOT/.env.local"
+    elif [[ -f "$REPO_ROOT/../.env"     ]]; then ENV_FILE="$REPO_ROOT/../.env"
+    fi
+fi
 
 # ===== logging =========================================================
 
@@ -85,16 +123,35 @@ fi
 ok "ssh works"
 
 if [[ "$MODE" != "update" ]]; then
-    [[ -n "${TURSO_DATABASE_URL:-}" ]] || fail "TURSO_DATABASE_URL must be set (export it before running, or use --update)"
-    [[ -n "${TURSO_AUTH_TOKEN:-}" ]]   || fail "TURSO_AUTH_TOKEN must be set (export it before running, or use --update)"
-    ok "turso credentials in env"
+    [[ -n "$ENV_FILE" && -f "$ENV_FILE" ]] || fail "no .env file found. expected one of: $REPO_ROOT/.env, $REPO_ROOT/.env.local, $REPO_ROOT/../.env, or pass --env-file PATH"
+
+    # Refuse to load a world-readable env file. Common rookie leak.
+    env_perms=$(stat -f '%Lp' "$ENV_FILE" 2>/dev/null || stat -c '%a' "$ENV_FILE" 2>/dev/null || echo "")
+    case "$env_perms" in
+        600|400|640|440) ;;  # acceptable
+        "") note "couldn't stat env-file permissions; proceeding" ;;
+        *)  note "env-file is mode $env_perms — recommend chmod 600 \"$ENV_FILE\"" ;;
+    esac
+
+    # shellcheck disable=SC1090
+    set -a; source "$ENV_FILE"; set +a
+
+    [[ -n "${TURSO_DATABASE_URL:-}" ]] || fail "TURSO_DATABASE_URL not set in $ENV_FILE"
+    [[ -n "${TURSO_AUTH_TOKEN:-}" ]]   || fail "TURSO_AUTH_TOKEN not set in $ENV_FILE"
+    ok "env file: $ENV_FILE"
+    ok "turso: TURSO_DATABASE_URL=<set> TURSO_AUTH_TOKEN=<set>"
+    if [[ -n "${CF_ACCOUNT_ID:-}" && -n "${CF_AI_TOKEN:-}" ]]; then
+        ok "cloudflare: CF_ACCOUNT_ID=<set> CF_AI_TOKEN=<set> (embeddings will be enabled)"
+    else
+        note "CF_ACCOUNT_ID / CF_AI_TOKEN not set — embeddings disabled on the deployed instance"
+    fi
 fi
 
 # ===== build ===========================================================
 
-step "building bin/ask.linux-amd64"
+step "building bin/vask.linux-amd64"
 ( cd "$REPO_ROOT" && make build-amd64 >/dev/null )
-ok "$(ls -lh "$REPO_ROOT/bin/ask.linux-amd64" | awk '{print $5, $9}')"
+ok "$(ls -lh "$REPO_ROOT/bin/vask.linux-amd64" | awk '{print $5, $9}')"
 
 # ===== bootstrap (idempotent) ==========================================
 
@@ -104,12 +161,12 @@ bootstrap_vm() {
 set -euo pipefail
 
 # 1. runtime user + dirs
-if ! id ask >/dev/null 2>&1; then
-    sudo useradd --system --home /opt/ask --shell /usr/sbin/nologin ask
-    echo "  · created ask user"
+if ! id vask >/dev/null 2>&1; then
+    sudo useradd --system --home /opt/vask --shell /usr/sbin/nologin vask
+    echo "  · created vask user"
 fi
-sudo mkdir -p /opt/ask/data
-sudo chown -R ask:ask /opt/ask
+sudo mkdir -p /opt/vask/data
+sudo chown -R vask:vask /opt/vask
 
 # 2. 1 GB swap (this VM has only 1 GB RAM)
 if ! swapon --show 2>/dev/null | grep -q '/swapfile'; then
@@ -152,39 +209,51 @@ REMOTE
 
 push_artifacts() {
     step "uploading binary + systemd unit"
-    scp "${SCP_OPTS[@]}" "$REPO_ROOT/bin/ask.linux-amd64" "$SSH_TARGET:/tmp/ask" >/dev/null
-    scp "${SCP_OPTS[@]}" "$REPO_ROOT/deploy/ask.service" "$SSH_TARGET:/tmp/" >/dev/null
+    scp "${SCP_OPTS[@]}" "$REPO_ROOT/bin/vask.linux-amd64" "$SSH_TARGET:/tmp/ask" >/dev/null
+    scp "${SCP_OPTS[@]}" "$REPO_ROOT/deploy/vask.service" "$SSH_TARGET:/tmp/" >/dev/null
     ok "uploaded to /tmp/"
 }
 
 # ===== push turso credentials ==========================================
 
 push_turso_env() {
-    step "writing /opt/ask/data/turso.env"
-    ssh "${SSH_OPTS[@]}" "$SSH_TARGET" "sudo tee /opt/ask/data/turso.env >/dev/null && sudo chmod 600 /opt/ask/data/turso.env && sudo chown ask:ask /opt/ask/data/turso.env" <<EOF
+    step "writing /opt/vask/data/turso.env"
+    # `install` creates the file mode 0600 owned by vask:vask before tee
+    # writes anything into it — so even mid-write the file is never
+    # world-readable. The values flow over ssh stdin, never as argv.
+    ssh "${SSH_OPTS[@]}" "$SSH_TARGET" \
+        'sudo install -o vask -g vask -m 0600 /dev/null /opt/vask/data/turso.env && sudo tee /opt/vask/data/turso.env >/dev/null' \
+        <<EOF
+# managed by deploy/setup-oracle.sh — DO NOT edit by hand
 TURSO_DATABASE_URL=$TURSO_DATABASE_URL
 TURSO_AUTH_TOKEN=$TURSO_AUTH_TOKEN
+CF_ACCOUNT_ID=${CF_ACCOUNT_ID:-}
+CF_AI_TOKEN=${CF_AI_TOKEN:-}
 EOF
-    ok "turso.env in place (chmod 600, owned by ask)"
+    if [[ -n "${CF_ACCOUNT_ID:-}" && -n "${CF_AI_TOKEN:-}" ]]; then
+        ok "turso.env in place (mode 0600, owned by ask, embeddings enabled)"
+    else
+        ok "turso.env in place (mode 0600, owned by ask, embeddings disabled)"
+    fi
 }
 
 # ===== install + start =================================================
 
 install_and_start() {
-    step "installing and (re)starting ask.service"
+    step "installing and (re)starting vask.service"
     ssh "${SSH_OPTS[@]}" "$SSH_TARGET" 'bash -s' <<'REMOTE'
 set -euo pipefail
-sudo install -o ask -g ask -m 0755 /tmp/ask /opt/ask/ask
-sudo mv /tmp/ask.service /etc/systemd/system/
+sudo install -o vask -g vask -m 0755 /tmp/ask /opt/vask/vask
+sudo mv /tmp/vask.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable ask >/dev/null 2>&1 || true
-sudo systemctl restart ask
+sudo systemctl enable vask >/dev/null 2>&1 || true
+sudo systemctl restart vask
 sleep 1
 echo "----"
-sudo systemctl status ask --no-pager --lines=8
+sudo systemctl status vask --no-pager --lines=8
 echo "----"
 echo "recent logs:"
-sudo journalctl -u ask --no-pager -n 6 --output=cat
+sudo journalctl -u vask --no-pager -n 6 --output=cat
 REMOTE
     ok "service running"
 }
@@ -212,14 +281,14 @@ step "done"
 
 # infer the public ask port from the deployed unit so the printed share
 # command always matches reality (port 22 after the migration, 2200 before).
-ask_port=$(grep -oE -- '--port [0-9]+' "$REPO_ROOT/deploy/ask.service" 2>/dev/null | awk '{print $2}' | head -1)
-ask_port="${ask_port:-22}"
-if [[ "$ask_port" == "22" ]]; then
-    share_cmd="ssh ask.vosslabs.org"
+vask_port=$(grep -oE -- '--port [0-9]+' "$REPO_ROOT/deploy/vask.service" 2>/dev/null | awk '{print $2}' | head -1)
+vask_port="${ask_port:-22}"
+if [[ "$vask_port" == "22" ]]; then
+    share_cmd="ssh vask.vosslabs.org"
     raw_cmd="ssh $VM_IP"
 else
-    share_cmd="ssh -p $ask_port ask.vosslabs.org"
-    raw_cmd="ssh -p $ask_port $VM_IP"
+    share_cmd="ssh -p $vask_port vask.vosslabs.org"
+    raw_cmd="ssh -p $vask_port $VM_IP"
 fi
 
 cat <<EOM
@@ -231,7 +300,7 @@ cat <<EOM
   raw IP test (no DNS needed):  ${c_dim}$raw_cmd${c_reset}
 
   tail server logs:
-    ${c_dim}ssh -p $SSH_PORT $SSH_TARGET sudo journalctl -u ask -f${c_reset}
+    ${c_dim}ssh -p $SSH_PORT $SSH_TARGET sudo journalctl -u vask -f${c_reset}
 
   redeploy after code changes:
     ${c_dim}./deploy/setup-oracle.sh --update${c_reset}
