@@ -17,13 +17,19 @@ on:
 permissions:
   contents: write
 
+# upload-artifact / download-artifact / softprops-action-gh-release are still
+# on Node 20 as of late 2025; this env var opts every JS action into Node 24
+# and silences the deprecation warning until upstream ships v5/v3.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
 jobs:
   test:
     if: github.repository == 'voss-labs/vask'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
         with:
           go-version: '1.22'
           cache: true
@@ -35,8 +41,8 @@ jobs:
     needs: test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
         with:
           go-version: '1.22'
           cache: true
@@ -75,22 +81,24 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: actions/download-artifact@v4
         with:
           name: binaries
           path: bin/
-      - name: stage env file
+      - name: stage deploy artifacts
         run: |
           umask 077
-          mkdir -p /tmp/dist
-          cp bin/vask.linux-amd64 /tmp/dist/vask.linux-amd64
-          cat > /tmp/dist/turso.env <<EOF
+          mkdir -p staged
+          cp bin/vask.linux-amd64 staged/vask.linux-amd64
+          cp deploy/vask.service  staged/vask.service
+          cat > staged/turso.env <<EOF
           TURSO_DATABASE_URL=${{ secrets.TURSO_DATABASE_URL }}
           TURSO_AUTH_TOKEN=${{ secrets.TURSO_AUTH_TOKEN }}
           CF_ACCOUNT_ID=${{ secrets.CF_ACCOUNT_ID }}
           CF_AI_TOKEN=${{ secrets.CF_AI_TOKEN }}
           EOF
+          ls -la staged/
       - name: scp to oracle
         uses: appleboy/scp-action@v0.1.7
         with:
@@ -98,9 +106,9 @@ jobs:
           port: ${{ secrets.ORACLE_SSH_PORT }}
           username: ${{ secrets.ORACLE_SSH_USER }}
           key: ${{ secrets.ORACLE_SSH_KEY }}
-          source: "/tmp/dist/vask.linux-amd64,/tmp/dist/turso.env,deploy/vask.service"
+          source: "staged/*"
           target: "/tmp/"
-          strip_components: 2
+          strip_components: 1
       - name: install + restart
         uses: appleboy/ssh-action@v1.0.3
         with:
