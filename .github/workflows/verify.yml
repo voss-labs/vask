@@ -5,6 +5,8 @@ on:
     - cron: '0 * * * *'   # hourly, on the hour
   workflow_dispatch:
 
+permissions: {}
+
 jobs:
   uptime:
     if: github.repository == 'voss-labs/vask'

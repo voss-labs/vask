@@ -1,0 +1,38 @@
+version: 2
+updates:
+  # GitHub Actions — keeps every action in .github/workflows/*.yml fresh.
+  # Dependabot opens PRs whenever a new minor/patch lands; major bumps
+  # need manual review (and we want that — actions occasionally rewrite
+  # their input schema between majors).
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: "Asia/Kolkata"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: ci
+    labels:
+      - dependencies
+      - github-actions
+
+  # Go modules — patches + minors only; major upgrades reviewed by hand.
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: "Asia/Kolkata"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: deps
+    labels:
+      - dependencies
+      - go
+    ignore:
+      - dependency-name: "*"
+        update-types:
+          - version-update:semver-major

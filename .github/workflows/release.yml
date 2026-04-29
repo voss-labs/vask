@@ -5,21 +5,19 @@ name: release
 #   - manual dispatch       → test → build → deploy → smoke (no release)
 #
 # Sequential pipeline. Each stage is a separate job with needs:; failures
-# stop the chain. release.yml subsumes the old deploy.yml because
-# GITHUB_TOKEN-published Releases don't trigger downstream workflows
-# (see https://docs.github.com/en/actions/using-workflows/triggering-a-workflow).
+# stop the chain. release.yml subsumes a separate deploy.yml because
+# GITHUB_TOKEN-published Releases don't trigger downstream workflows.
 
 on:
   push:
     tags: ['v*.*.*']
   workflow_dispatch:
 
-permissions:
-  contents: write
+# Default to no permissions; jobs grant only what they need.
+permissions: {}
 
-# upload-artifact / download-artifact / softprops-action-gh-release are still
-# on Node 20 as of late 2025; this env var opts every JS action into Node 24
-# and silences the deprecation warning until upstream ships v5/v3.
+# upload-artifact / download-artifact at v4 are still Node 20-based;
+# this env var opts them into the Node 24 runtime to silence deprecation.
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
 
@@ -27,8 +25,10 @@ jobs:
   test:
     if: github.repository == 'voss-labs/vask'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - uses: actions/setup-go@v6
         with:
           go-version: '1.24'
@@ -40,8 +40,10 @@ jobs:
   build:
     needs: test
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - uses: actions/setup-go@v6
         with:
           go-version: '1.24'
@@ -67,12 +69,14 @@ jobs:
     needs: build
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
+    permissions:
+      contents: write     # softprops/action-gh-release needs this
     steps:
       - uses: actions/download-artifact@v4
         with:
           name: binaries
           path: bin/
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           files: bin/*
           generate_release_notes: true
@@ -80,8 +84,10 @@ jobs:
   deploy:
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - uses: actions/download-artifact@v4
         with:
           name: binaries
@@ -110,7 +116,7 @@ jobs:
           target: "/tmp/"
           strip_components: 1
       - name: install + restart
-        uses: appleboy/ssh-action@v1.0.3
+        uses: appleboy/ssh-action@v1.2.4
         with:
           host: ${{ secrets.ORACLE_SSH_HOST }}
           port: ${{ secrets.ORACLE_SSH_PORT }}
@@ -129,6 +135,7 @@ jobs:
   smoke:
     needs: deploy
     runs-on: ubuntu-latest
+    permissions: {}
     steps:
       - name: probe IP + domain
         run: |
