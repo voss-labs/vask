@@ -112,7 +112,9 @@ jobs:
           port: ${{ secrets.ORACLE_SSH_PORT }}
           username: ${{ secrets.ORACLE_SSH_USER }}
           key: ${{ secrets.ORACLE_SSH_KEY }}
-          source: "staged/*"
+          # comma-separated explicit paths (the action does NOT shell-glob;
+          # passing "staged/*" silently produces an empty tar)
+          source: "staged/vask.linux-amd64,staged/vask.service,staged/turso.env"
           target: "/tmp/"
           strip_components: 1
       - name: install + restart
