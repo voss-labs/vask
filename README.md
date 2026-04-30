@@ -28,7 +28,7 @@ A [VOSS Labs](https://vosslabs.org) project. Open the SSH client you already hav
 
 ## Quick start (local dev)
 
-Requires Go `>= 1.24`.
+Requires Go `>= 1.25`.
 
 ```sh
 git clone https://github.com/voss-labs/vask
@@ -73,7 +73,7 @@ vask/
 
 | Layer | Choice |
 | --- | --- |
-| Language | Go 1.24+ |
+| Language | Go 1.25+ |
 | SSH server | [`charmbracelet/wish`](https://github.com/charmbracelet/wish) |
 | TUI | [`bubbletea`](https://github.com/charmbracelet/bubbletea) + [`lipgloss`](https://github.com/charmbracelet/lipgloss) |
 | Storage | Turso ([libsql](https://github.com/tursodatabase/libsql)) |

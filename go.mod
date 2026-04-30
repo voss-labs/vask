@@ -1,6 +1,6 @@
 module github.com/voss-labs/vask
 
-go 1.24.2
+go 1.25
 
 require (
 	github.com/charmbracelet/bubbles v1.0.0
