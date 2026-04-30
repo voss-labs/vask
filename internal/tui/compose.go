@@ -11,6 +11,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/voss-labs/vask/internal/embed"
 	"github.com/voss-labs/vask/internal/policy"
 	"github.com/voss-labs/vask/internal/ratelimit"
 	"github.com/voss-labs/vask/internal/store"
@@ -25,6 +26,13 @@ const (
 	stepTitle = 0
 	stepBody  = 1
 	stepTags  = 2
+
+	// drafter sub-states — when non-zero, the drafter owns the keyboard
+	// and the compose view is replaced with the draft picker UI.
+	drafterOff     = 0
+	drafterPrompt  = 1
+	drafterLoading = 2
+	drafterPick    = 3
 )
 
 // Seed suggestions when the DB has fewer than 6 distinct tags. Once enough
@@ -65,6 +73,14 @@ type composeModel struct {
 	// Esc on a non-empty draft arms this; the next `y` confirms discard,
 	// anything else cancels. Saves users from one-keystroke draft loss.
 	pendingDiscard bool
+
+	// drafter is the optional ai-assist sub-flow. ctrl+d on the title
+	// step (when AI is configured) enters drafterPrompt; on pick the
+	// chosen variant fills title/body/tags and the user lands back in
+	// stepTitle to edit before sending.
+	drafterStep     int
+	drafterInput    textinput.Model
+	drafterVariants []embed.DraftVariant
 }
 
 type composePostedMsg struct {
@@ -78,6 +94,11 @@ type composeSuggestionsMsg struct {
 
 type composeSimilarTagsMsg struct {
 	tags []string
+}
+
+type composeDrafterVariantsMsg struct {
+	variants []embed.DraftVariant
+	err      error
 }
 
 func newCompose(st *store.Store, user *store.User) composeModel {
@@ -107,14 +128,22 @@ func newCompose(st *store.Store, user *store.User) composeModel {
 	tags.Prompt = ""
 	tags.Cursor.Style = lipgloss.NewStyle().Foreground(colorBrand)
 
+	drafter := textinput.New()
+	drafter.Placeholder = "one line — what's the rant or question?"
+	drafter.Width = ContentWidth - 4
+	drafter.CharLimit = fpMaxDilemma
+	drafter.Prompt = ""
+	drafter.Cursor.Style = lipgloss.NewStyle().Foreground(colorBrand)
+
 	c := composeModel{
-		st:      st,
-		user:    user,
-		limiter: ratelimit.NewPostLimiter(st, 5),
-		title:   title,
-		body:    body,
-		tags:    tags,
-		step:    stepTitle,
+		st:           st,
+		user:         user,
+		limiter:      ratelimit.NewPostLimiter(st, 5),
+		title:        title,
+		body:         body,
+		tags:         tags,
+		step:         stepTitle,
+		drafterInput: drafter,
 	}
 	// FOCUS BUG FIX: focus the initial step's input so the very first keystroke
 	// types into it. Previously the focus was never set, so users had to press
@@ -204,6 +233,18 @@ func (m composeModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case composeSimilarTagsMsg:
 		m.similarTags = msg.tags
+	case composeDrafterVariantsMsg:
+		if msg.err != nil || len(msg.variants) == 0 {
+			m.drafterStep = drafterPrompt
+			m.status = "couldn't draft anything just now — try rewording, or esc to cancel"
+			m.statusKind = "err"
+			m.drafterInput.Focus()
+			return m, m.drafterInput.Cursor.BlinkCmd()
+		}
+		m.drafterVariants = msg.variants
+		m.drafterStep = drafterPick
+		m.clearStatus()
+		return m, nil
 	case composePostedMsg:
 		m.sending = false
 		if msg.err != nil {
@@ -215,6 +256,10 @@ func (m composeModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		if m.sending {
 			return m, nil
+		}
+		// Drafter sub-flow owns the keyboard while it's open.
+		if m.drafterStep != drafterOff {
+			return m.updateDrafter(msg)
 		}
 		// While a discard is armed, intercept `y` to confirm and any other
 		// key (including esc) to cancel the prompt. ctrl+c still quits.
@@ -278,6 +323,17 @@ func (m composeModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m.advanceStep()
 			}
 			return m.submit()
+		case "ctrl+d":
+			// AI assist: only on the title step, only when configured.
+			if m.step != stepTitle || m.st.EmbedClient() == nil {
+				return m, nil
+			}
+			m.drafterStep = drafterPrompt
+			m.drafterInput.SetValue("")
+			m.drafterInput.Focus()
+			m.title.Blur()
+			m.clearStatus()
+			return m, m.drafterInput.Cursor.BlinkCmd()
 		}
 	}
 
@@ -306,6 +362,93 @@ func (m composeModel) applyStepFocus() composeModel {
 		m.tags.Focus()
 	}
 	return m
+}
+
+// updateDrafter handles keystrokes while the AI-assist sub-flow is open.
+// Esc cancels back to the regular compose view; enter on a non-empty line
+// kicks off the model call; 1/2 in the pick state fills the title/body/
+// tags fields with the chosen variant and returns control to the title
+// step for review.
+func (m composeModel) updateDrafter(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch m.drafterStep {
+	case drafterPrompt:
+		switch msg.String() {
+		case "ctrl+c":
+			return m, tea.Quit
+		case "esc":
+			m.drafterStep = drafterOff
+			m.drafterInput.Blur()
+			m.clearStatus()
+			return m.applyStepFocus(), nil
+		case "enter":
+			dilemma := strings.TrimSpace(m.drafterInput.Value())
+			if dilemma == "" {
+				return m, nil
+			}
+			m.drafterStep = drafterLoading
+			m.clearStatus()
+			return m, m.drafterCmd(dilemma)
+		}
+		var cmd tea.Cmd
+		m.drafterInput, cmd = m.drafterInput.Update(msg)
+		return m, cmd
+	case drafterLoading:
+		if msg.String() == "ctrl+c" {
+			return m, tea.Quit
+		}
+		return m, nil
+	case drafterPick:
+		switch msg.String() {
+		case "ctrl+c":
+			return m, tea.Quit
+		case "esc":
+			m.drafterStep = drafterOff
+			m.drafterInput.Blur()
+			m.clearStatus()
+			return m.applyStepFocus(), nil
+		case "r", "R":
+			dilemma := strings.TrimSpace(m.drafterInput.Value())
+			if dilemma == "" {
+				return m, nil
+			}
+			m.drafterStep = drafterLoading
+			m.drafterVariants = nil
+			return m, m.drafterCmd(dilemma)
+		case "1", "2":
+			idx := int(msg.String()[0] - '1')
+			if idx < 0 || idx >= len(m.drafterVariants) {
+				return m, nil
+			}
+			v := m.drafterVariants[idx]
+			m.title.SetValue(strings.TrimSpace(v.Title))
+			m.body.SetValue(strings.TrimSpace(v.Body))
+			m.tags.SetValue(strings.Join(normalizeDraftTags(v.Tags), ", "))
+			m.drafterStep = drafterOff
+			m.drafterInput.Blur()
+			m.drafterVariants = nil
+			m.step = stepTitle
+			m.clearStatus()
+			m.status = "drafted from your line · edit anything before sending"
+			m.statusKind = "ok"
+			return m.applyStepFocus(), nil
+		}
+		return m, nil
+	}
+	return m, nil
+}
+
+func (m composeModel) drafterCmd(dilemma string) tea.Cmd {
+	st := m.st
+	return func() tea.Msg {
+		client := st.EmbedClient()
+		if client == nil {
+			return composeDrafterVariantsMsg{err: embed.ErrNotConfigured}
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+		defer cancel()
+		v, err := client.Draft(ctx, dilemma)
+		return composeDrafterVariantsMsg{variants: v, err: err}
+	}
 }
 
 // advanceStep is the focus-shift wrapper used by every step transition
@@ -428,6 +571,9 @@ func (m composeModel) submit() (tea.Model, tea.Cmd) {
 // === view ============================================================
 
 func (m composeModel) View() string {
+	if m.drafterStep != drafterOff {
+		return m.viewDrafter()
+	}
 	header := renderComposeHeader(m.step)
 	dots := renderStepDots(m.step)
 
@@ -626,12 +772,73 @@ func renderStatus(s, kind string) string {
 	return lipgloss.NewStyle().Width(ContentWidth).MarginTop(1).Render(styled)
 }
 
+func (m composeModel) viewDrafter() string {
+	header := brandText.Render("ai assist · draft from one line")
+	tagline := textDim.Render("type a one-liner · we'll suggest two anonymous angles")
+	rule := lipgloss.NewStyle().Foreground(colorBorder).
+		Render(strings.Repeat("─", ContentWidth-4))
+
+	var bodyBlock string
+	switch m.drafterStep {
+	case drafterPrompt:
+		intro := textBody.Render("nothing about your line gets saved.")
+		box := formBoxFocused.Render(m.drafterInput.View())
+		counter := lipgloss.NewStyle().
+			Width(ContentWidth).Align(lipgloss.Right).Foreground(colorTextMute).
+			Render(fmt.Sprintf("%d / %d", len(m.drafterInput.Value()), fpMaxDilemma))
+		bodyBlock = lipgloss.JoinVertical(lipgloss.Left,
+			intro, "", box, counter,
+		)
+	case drafterLoading:
+		bodyBlock = textBody.Render(
+			"asking gemma-4 for two short anonymous variants · 5-15 seconds…",
+		)
+	case drafterPick:
+		cards := make([]string, 0, len(m.drafterVariants))
+		for i, v := range m.drafterVariants {
+			cards = append(cards, renderVariantCard(i+1, v))
+		}
+		bodyBlock = lipgloss.JoinVertical(lipgloss.Left, cards...)
+	}
+
+	statusLine := ""
+	if m.status != "" {
+		statusLine = renderStatus(m.status, m.statusKind)
+	}
+
+	var keys []string
+	switch m.drafterStep {
+	case drafterPrompt:
+		keys = []string{
+			renderKey("enter", "draft"),
+			renderKey("esc", "cancel"),
+		}
+	case drafterLoading:
+		keys = []string{renderKey("ctrl+c", "quit")}
+	case drafterPick:
+		keys = []string{
+			renderKey("1-2", "use that one"),
+			renderKey("r", "redraft"),
+			renderKey("esc", "cancel"),
+		}
+	}
+	row := strings.Join(keys, renderKeySep())
+	footer := footerStyle.Render(
+		lipgloss.NewStyle().Width(ContentWidth).Align(lipgloss.Center).Render(row),
+	)
+
+	return frameStyle.Render(lipgloss.JoinVertical(lipgloss.Left,
+		header, tagline, rule, "", bodyBlock, "", statusLine, footer,
+	))
+}
+
 func renderComposeFooter(step int) string {
 	var keys []string
 	switch step {
 	case stepTitle:
 		keys = []string{
 			renderKey("enter", "continue"),
+			renderKey("ctrl+d", "ai draft"),
 			renderKey("esc", "cancel"),
 		}
 	case stepBody:

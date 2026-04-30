@@ -92,6 +92,26 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case usernameAcceptedMsg:
 		a.user.Username = m.username
+		// New users with AI configured get the optional starter-post
+		// nudge; everyone else lands on the feed.
+		if a.st.EmbedClient() != nil {
+			fp := newFirstPost(a.st, a.user)
+			a.current = fp
+			return a, tea.Batch(fp.Init(), a.forwardSize())
+		}
+		feed := newFeed(a.st, a.user)
+		a.current = feed
+		return a, tea.Batch(feed.Init(), a.forwardSize())
+
+	case firstpostSkipMsg:
+		feed := newFeed(a.st, a.user)
+		a.current = feed
+		return a, tea.Batch(feed.Init(), a.forwardSize())
+
+	case firstpostDoneMsg:
+		// Ignore postID for now — the feed refresh will surface the new
+		// post at the top under SortHot/New.
+		_ = m
 		feed := newFeed(a.st, a.user)
 		a.current = feed
 		return a, tea.Batch(feed.Init(), a.forwardSize())

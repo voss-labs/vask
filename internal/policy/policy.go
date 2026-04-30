@@ -21,9 +21,15 @@ var (
 	reTelegram = regexp.MustCompile(`(?i)t\.me/[a-z0-9_]{4,}`)
 	reEmail    = regexp.MustCompile(`(?i)[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}`)
 
-	// crude full-name heuristic: 2+ consecutive Capitalized words.
+	// crude full-name heuristic: 2+ consecutive Capitalized words,
+	// optionally with a middle initial ("Riya M Sharma", "Riya M. Sharma").
 	// false-positive prone, paired with confirm dialog.
-	reFullName = regexp.MustCompile(`\b[A-Z][a-z]{2,}\s+[A-Z][a-z]{2,}\b`)
+	reFullName = regexp.MustCompile(`\b[A-Z][a-z]{1,}(?:\s+[A-Z]\.?)?\s+[A-Z][a-z]{1,}\b`)
+
+	// honorific + Capitalized word: "Dr. Sharma", "Prof Kulkarni",
+	// "Sir Reddy", "Ma'am Iyer". Lower-case match on the honorific to
+	// catch casual spellings.
+	reHonorificName = regexp.MustCompile(`(?i)\b(?:dr|prof|professor|sir|madam|ma'?am|mr|mrs|ms)\.?\s+[A-Z][a-z]{1,}\b`)
 
 	// class schedule specifics: "CS-A 3rd year", "BE Mech", "B-section"
 	reClassSpec = regexp.MustCompile(`(?i)\b(?:cs|it|extc|mech|civil|aiml|ai-?ds|biotech)[\s-][a-z](\b|\s+\d)`)
@@ -48,6 +54,7 @@ func Inspect(body string) []Flag {
 	check("telegram handle", reTelegram)
 	check("email", reEmail)
 	check("class section", reClassSpec)
+	check("honorific + name", reHonorificName)
 	check("full name", reFullName)
 	return flags
 }
