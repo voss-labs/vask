@@ -28,8 +28,8 @@ Then re-run `ssh vask.vosslabs.org`. Your private key stays on your machine — 
 ## What's in it
 
 - **Feed** — hot / new / top sort, tag filter, semantic search (`/`), per-page navigation (`[`/`]`).
-- **Detail** — threaded comments, reply, vote, collapse subtrees, "similar posts" rail.
-- **Compose** — 3-step wizard with live preview and tag suggestions inferred from semantically similar posts.
+- **Detail** — threaded comments, reply, vote, collapse subtrees.
+- **Compose** — 3-step wizard with live preview, tag suggestions inferred from semantically similar posts, and optional AI draft (`ctrl+d`).
 - **Identity** — auto-generated handles like `polite-okapi` (race-safe atomic claim, no real names).
 - **Activity** — `Y` opens "your last posts + comments" for one-key thread navigation.
 - **Help** — `?` opens the full keybind sheet, `i` opens the about screen.

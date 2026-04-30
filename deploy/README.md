@@ -55,7 +55,7 @@ If `TURSO_DATABASE_URL` is unset, the binary falls back to a local SQLite file. 
 
 ## Embeddings — Cloudflare Workers AI (optional)
 
-Semantic search, the similar-posts rail, and compose tag suggestions all run on `@cf/baai/bge-m3`.
+Semantic search and compose tag suggestions run on `@cf/baai/bge-m3`. AI-assisted post drafting (firstpost nudge + `ctrl+d` in compose) runs on `@cf/google/gemma-3-12b-it`.
 
 1. **Account ID** — dashboard → Workers & Pages → Overview → right sidebar.
 2. **Token** — dashboard → My Profile → API Tokens → Create token → "Workers AI" template.
@@ -71,7 +71,7 @@ Semantic search, the similar-posts rail, and compose tag suggestions all run on 
    go run ./cmd/vask-embed-backfill
    ```
 
-Leaving `CF_*` blank disables embeddings end-to-end. The app still runs; `/` falls back to LIKE search, the similar-posts rail stays hidden, no compose suggestions.
+Leaving `CF_*` blank disables embeddings and AI drafting end-to-end. The app still runs; `/` falls back to LIKE search, no compose tag suggestions, and the AI draft prompts disappear.
 
 Cost at typical campus scale: ~1,300 neurons/month vs free tier's 10K *per day* — effectively free.
 

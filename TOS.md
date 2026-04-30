@@ -22,7 +22,7 @@ A handful of UI moments offer to draft a post for you:
 - The first-connect "what's on your mind?" nudge after onboarding.
 - `ctrl+d` on the title step inside compose.
 
-Both run the line you type through Cloudflare Workers AI (model: `@cf/google/gemma-4-26b-a4b-it`). Cloudflare's terms state Workers AI inputs are not retained or used for training. The line you typed is never written to our database — only the post you choose to send is, exactly like a hand-written post.
+Both run the line you type through Cloudflare Workers AI (model: `@cf/google/gemma-3-12b-it`). Cloudflare's terms state Workers AI inputs are not retained or used for training. The line you typed is never written to our database — only the post you choose to send is, exactly like a hand-written post.
 
 Skip these prompts if you'd rather not send anything to the model. Press `s` or `esc` to drop straight to the feed.
 

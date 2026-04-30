@@ -39,22 +39,10 @@ set -euo pipefail
 
 # ===== config ==========================================================
 
-VM_IP="${VM_IP:-129.153.206.68}"
+VM_IP="${VM_IP:?VM_IP must be set — your Oracle VM's public IP}"
 SSH_USER="${SSH_USER:-ubuntu}"
 SSH_PORT="${SSH_PORT:-22000}"   # management ssh — moved off 22 to free that port for ask
-
-if [[ -z "${SSH_KEY:-}" ]]; then
-    for candidate in \
-        "$HOME/.ssh/oracle-ask.key" \
-        "$HOME/.ssh/oracle.key" \
-        "$HOME/.ssh/voss.key"; do
-        if [[ -f "$candidate" ]]; then
-            SSH_KEY="$candidate"
-            break
-        fi
-    done
-fi
-SSH_KEY="${SSH_KEY:-$HOME/.ssh/oracle-ask.key}"
+SSH_KEY="${SSH_KEY:-$HOME/.ssh/id_ed25519}"
 SSH_TARGET="$SSH_USER@$VM_IP"
 # ssh and scp disagree on the port flag (-p lowercase vs -P uppercase). Keep separate.
 SSH_OPTS=(-i "$SSH_KEY" -p "$SSH_PORT" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new)

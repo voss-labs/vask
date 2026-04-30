@@ -19,8 +19,8 @@
 
 set -uo pipefail   # intentionally NOT -e: keep checking after a failure
 
-VM_IP="${VM_IP:-129.153.206.68}"
-SSH_KEY="${SSH_KEY:-$HOME/.ssh/oracle-ask.key}"
+VM_IP="${VM_IP:?VM_IP must be set — your Oracle VM's public IP}"
+SSH_KEY="${SSH_KEY:-$HOME/.ssh/id_ed25519}"
 SSH_USER="${SSH_USER:-ubuntu}"
 SSH_PORT="${SSH_PORT:-22000}"   # management ssh after the port-22 cutover
 SSH_TARGET="$SSH_USER@$VM_IP"

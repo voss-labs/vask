@@ -19,8 +19,8 @@
 
 set -euo pipefail
 
-VM_IP="${VM_IP:-129.153.206.68}"
-SSH_KEY="${SSH_KEY:-$HOME/.ssh/oracle-ask.key}"
+VM_IP="${VM_IP:?VM_IP must be set — your Oracle VM's public IP}"
+SSH_KEY="${SSH_KEY:-$HOME/.ssh/id_ed25519}"
 SSH_USER="${SSH_USER:-ubuntu}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
