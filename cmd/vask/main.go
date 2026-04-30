@@ -29,13 +29,26 @@ import (
 )
 
 // Force truecolor escape codes regardless of the host TERM.
-// systemd starts ask with no TERM set, which would otherwise make
+// systemd starts vask with no TERM set, which would otherwise make
 // lipgloss/termenv emit plain text. Every SSH client we care about
 // renders 24-bit color, so this is safe and fixes the "no colors over
 // SSH" issue universally.
 func init() {
 	lipgloss.SetColorProfile(termenv.TrueColor)
 }
+
+const connectBanner = `
+welcome to vask — anonymous campus q&a, terminal-native.
+
+if you see "permission denied (publickey)" below, you don't have an
+ssh key on this device yet. one-time setup:
+
+    ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_ed25519
+
+then retry: ssh vask.vosslabs.org
+your key never leaves your machine — vask only reads sha256(pubkey).
+
+`
 
 func main() {
 	host := flag.String("host", "0.0.0.0", "interface to bind")
@@ -80,6 +93,11 @@ func main() {
 	srv, err := wish.NewServer(
 		wish.WithAddress(net.JoinHostPort(*host, *port)),
 		wish.WithHostKeyPath(*hostKey),
+		// Pre-auth banner: shown to every connecting client before auth
+		// completes. Helps users on a fresh machine who don't yet have an
+		// ssh key, since their auth will fail with "permission denied
+		// (publickey)" and they'd otherwise have no idea what to do.
+		wish.WithBanner(connectBanner),
 		wish.WithPublicKeyAuth(func(_ ssh.Context, _ ssh.PublicKey) bool {
 			// accept any pubkey; identity is the fingerprint hash, not a whitelist.
 			return true

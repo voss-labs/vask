@@ -9,6 +9,14 @@ ssh vask.vosslabs.org
 
 A [VOSS Labs](https://vosslabs.org) project. Open the SSH client you already have, get a campus forum. No web app, no notifications, no inbox.
 
+**First time?** If `ssh vask.vosslabs.org` says `permission denied (publickey)`, you need an SSH key on this device. One-time setup:
+
+```sh
+ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_ed25519
+```
+
+Then re-run `ssh vask.vosslabs.org`. Your private key stays on your machine — vask only reads `sha256(public_key)` as your identity, never the key itself.
+
 ## How it works
 
 - You connect with `ssh vask.vosslabs.org`. Your SSH client does the handshake.
