@@ -11,7 +11,7 @@ import (
 	"strings"
 )
 
-const draftModel = "@cf/google/gemma-4-26b-a4b-it"
+const draftModel = "@cf/google/gemma-3-12b-it"
 
 type DraftVariant struct {
 	Title string   `json:"title"`
@@ -22,22 +22,21 @@ type DraftVariant struct {
 // draftSystem is the model contract. Tweak this string and the entire
 // vibe of AI-drafted posts changes — keep it tight, opinionated, and
 // loud about the "no names" rule because the model will obey if asked.
-const draftSystem = `you write very short anonymous campus-forum posts in the voice of an indian college student. follow every rule:
+const draftSystem = `you are a normal gen-z draft generator for an anonymous indian campus forum. write one short post and stop. do not overanalyze. do not make a constraint checklist. do not explore multiple scenarios. just write the draft.
 
+rules:
 - lowercase only, no emojis, no markdown
-- no real names of people, professors, companies, brands, products, places, or apps. if the user mentions one, replace with a generic description (eg "the OS prof", "a guy from cs-a", "a tier-1 product company")
+- no real names of people, professors, companies, brands, products, places, or apps. swap real names for generic descriptions like "the OS prof" or "a tier-1 product company".
 - title: 4-8 words, punchy
-- body: 1-2 sentences MAX, 15-25 words total. tight. no setup paragraphs.
-- lead with the feeling or the take, end with one real question that invites replies
-- casual student tone. drop "ngl", "tbh", "honestly", "anyone else", "wait" naturally — sparingly
-- the user is asking, not advising
+- body: 1-2 sentences, 15-25 words total
+- end with one real question that invites replies
+- casual student tone — drop "ngl", "tbh", "honestly", "anyone else", "wait" sparingly
 
-return only a json array of two variants — different angles on the same situation:
+return only this exact json array, with ONE object:
 [
-  {"title": "...", "body": "...", "tags": ["...", "..."]},
   {"title": "...", "body": "...", "tags": ["...", "..."]}
 ]
-each tag is one lowercase word or hyphenated phrase. 2-4 tags per variant. no other text outside the array.`
+2-4 lowercase or hyphenated tags. no other text outside the array.`
 
 // Draft asks the LLM to turn a 1-line user dilemma into 2 ready-to-post
 // variants. Returns ErrNotConfigured if the client wasn't set up; any
@@ -53,11 +52,9 @@ func (c *Client) Draft(ctx context.Context, dilemma string) ([]DraftVariant, err
 			{"role": "system", "content": draftSystem},
 			{"role": "user", "content": dilemma},
 		},
-		// gemma-4 is a reasoning model — most of max_tokens goes to
-		// internal "thinking" tokens before any visible JSON. At 600
-		// it hits finish_reason=length with content=null. 4000 leaves
-		// ~2000-3000 reasoning + ~500 JSON output. cURL clocks ~26s.
-		"max_tokens":  4000,
+		// gemma-3-12b-it is non-reasoning — emits ~50 tokens of JSON
+		// directly in 1-2s. 600 is generous headroom.
+		"max_tokens":  600,
 		"temperature": 0.8,
 	})
 	url := "https://api.cloudflare.com/client/v4/accounts/" + c.accountID +

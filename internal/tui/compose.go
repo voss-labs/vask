@@ -414,12 +414,11 @@ func (m composeModel) updateDrafter(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.drafterStep = drafterLoading
 			m.drafterVariants = nil
 			return m, m.drafterCmd(dilemma)
-		case "1", "2":
-			idx := int(msg.String()[0] - '1')
-			if idx < 0 || idx >= len(m.drafterVariants) {
+		case "enter":
+			if len(m.drafterVariants) == 0 {
 				return m, nil
 			}
-			v := m.drafterVariants[idx]
+			v := m.drafterVariants[0]
 			m.title.SetValue(strings.TrimSpace(v.Title))
 			m.body.SetValue(strings.TrimSpace(v.Body))
 			m.tags.SetValue(strings.Join(normalizeDraftTags(v.Tags), ", "))
@@ -774,7 +773,7 @@ func renderStatus(s, kind string) string {
 
 func (m composeModel) viewDrafter() string {
 	header := brandText.Render("ai assist · draft from one line")
-	tagline := textDim.Render("type a one-liner · we'll suggest two anonymous angles")
+	tagline := textDim.Render("type a one-liner · we'll draft a starter post you can edit")
 	rule := lipgloss.NewStyle().Foreground(colorBorder).
 		Render(strings.Repeat("─", ContentWidth-4))
 
@@ -791,14 +790,12 @@ func (m composeModel) viewDrafter() string {
 		)
 	case drafterLoading:
 		bodyBlock = textBody.Render(
-			"drafting two short anonymous variants · usually 15-30 seconds…",
+			"drafting a short anonymous post · usually 2-3 seconds…",
 		)
 	case drafterPick:
-		cards := make([]string, 0, len(m.drafterVariants))
-		for i, v := range m.drafterVariants {
-			cards = append(cards, renderVariantCard(i+1, v))
+		if len(m.drafterVariants) > 0 {
+			bodyBlock = renderVariantCard(0, m.drafterVariants[0])
 		}
-		bodyBlock = lipgloss.JoinVertical(lipgloss.Left, cards...)
 	}
 
 	statusLine := ""
@@ -817,8 +814,8 @@ func (m composeModel) viewDrafter() string {
 		keys = []string{renderKey("ctrl+c", "quit")}
 	case drafterPick:
 		keys = []string{
-			renderKey("1-2", "use that one"),
-			renderKey("r", "redraft"),
+			renderKey("enter", "use this draft"),
+			renderKey("r", "reroll"),
 			renderKey("esc", "cancel"),
 		}
 	}

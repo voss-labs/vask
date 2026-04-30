@@ -130,7 +130,10 @@ func (m firstpostModel) updateDilemma(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "ctrl+c":
 		return m, tea.Quit
-	case "esc":
+	case "esc", "S":
+		// Capital S only — lowercase s is a real letter people start
+		// dilemmas with ("school", "stipend", etc.), so skipping on it
+		// would steal their first keystroke.
 		return m, func() tea.Msg { return firstpostSkipMsg{} }
 	case "enter":
 		dilemma := strings.TrimSpace(m.input.Value())
@@ -141,11 +144,6 @@ func (m firstpostModel) updateDilemma(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.status = ""
 		return m, m.draftCmd(dilemma)
 	}
-	// `s` only skips when the input is empty — otherwise the user is
-	// trying to type the letter into their dilemma.
-	if msg.String() == "s" && strings.TrimSpace(m.input.Value()) == "" {
-		return m, func() tea.Msg { return firstpostSkipMsg{} }
-	}
 	var cmd tea.Cmd
 	m.input, cmd = m.input.Update(msg)
 	return m, cmd
@@ -155,7 +153,7 @@ func (m firstpostModel) updatePick(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "ctrl+c":
 		return m, tea.Quit
-	case "esc", "s", "S":
+	case "esc", "S":
 		return m, func() tea.Msg { return firstpostSkipMsg{} }
 	case "r", "R":
 		dilemma := strings.TrimSpace(m.input.Value())
@@ -165,14 +163,12 @@ func (m firstpostModel) updatePick(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.variants = nil
 		m.step = fpStepLoading
 		return m, m.draftCmd(dilemma)
-	case "1", "2":
-		idx := int(msg.String()[0] - '1')
-		if idx < 0 || idx >= len(m.variants) {
+	case "enter":
+		if len(m.variants) == 0 {
 			return m, nil
 		}
-		m.chosen = idx
 		m.step = fpStepPosting
-		return m, m.postCmd(m.variants[idx])
+		return m, m.postCmd(m.variants[0])
 	}
 	return m, nil
 }
@@ -254,8 +250,9 @@ func (m firstpostModel) viewDilemma() string {
 
 	intro := textBody.Render(
 		"give us one line — a dilemma, a hot take, a thing you wish someone\n" +
-			"would tell you. we'll draft two anonymous starter posts you can\n" +
-			"send in one keystroke. nothing about your line gets saved.",
+			"would tell you. we'll draft an anonymous starter post you can send\n" +
+			"in one keystroke (or reroll until you like it). nothing about your\n" +
+			"line gets saved.",
 	)
 
 	prompt := textBody.Render("what's on your mind?")
@@ -279,9 +276,9 @@ func (m firstpostModel) viewDilemma() string {
 	}
 
 	keys := lipgloss.JoinHorizontal(lipgloss.Left,
-		renderKey("enter", "draft variants"),
+		renderKey("enter", "draft post"),
 		renderKeySep(),
-		renderKey("s", "skip to feed"),
+		renderKey("S", "skip to feed"),
 		renderKeySep(),
 		renderKey("esc", "skip"),
 	)
@@ -303,14 +300,13 @@ func (m firstpostModel) viewDilemma() string {
 
 func (m firstpostModel) viewLoading() string {
 	header := brandText.Render("drafting…")
-	tagline := textDim.Render("usually 15-30 seconds")
+	tagline := textDim.Render("usually 2-3 seconds")
 
 	rule := lipgloss.NewStyle().Foreground(colorBorder).
 		Render(strings.Repeat("─", ContentWidth-4))
 
 	body := textBody.Render(
-		"sit tight. drafting two short anonymous variants of your line —\n" +
-			"different angles on the same situation.",
+		"sit tight. drafting a short anonymous post from your line.",
 	)
 
 	hint := textMute.Render("ctrl+c to quit")
@@ -324,17 +320,16 @@ func (m firstpostModel) viewLoading() string {
 }
 
 func (m firstpostModel) viewPick() string {
-	header := brandText.Render("pick one to post")
-	tagline := textDim.Render("two angles on your line · or redraft · or skip")
+	header := brandText.Render("post or reroll")
+	tagline := textDim.Render("send this one · reroll for a new draft · skip")
 
 	rule := lipgloss.NewStyle().Foreground(colorBorder).
 		Render(strings.Repeat("─", ContentWidth-4))
 
-	cards := make([]string, 0, len(m.variants))
-	for i, v := range m.variants {
-		cards = append(cards, renderVariantCard(i+1, v))
+	var cardBlock string
+	if len(m.variants) > 0 {
+		cardBlock = renderVariantCard(0, m.variants[0])
 	}
-	cardsBlock := lipgloss.JoinVertical(lipgloss.Left, cards...)
 
 	statusLine := ""
 	if m.status != "" {
@@ -342,18 +337,18 @@ func (m firstpostModel) viewPick() string {
 	}
 
 	keys := lipgloss.JoinHorizontal(lipgloss.Left,
-		renderKey("1-2", "post that one"),
+		renderKey("enter", "post"),
 		renderKeySep(),
-		renderKey("r", "redraft"),
+		renderKey("r", "reroll"),
 		renderKeySep(),
-		renderKey("s", "skip"),
+		renderKey("S", "skip"),
 	)
 	footer := footerStyle.Render(
 		lipgloss.NewStyle().Width(ContentWidth).Align(lipgloss.Center).Render(keys),
 	)
 
 	return frameStyle.Render(lipgloss.JoinVertical(lipgloss.Left,
-		header, tagline, rule, "", cardsBlock, "", statusLine, footer,
+		header, tagline, rule, "", cardBlock, "", statusLine, footer,
 	))
 }
 
@@ -374,10 +369,16 @@ func (m firstpostModel) viewPosting() string {
 	))
 }
 
+// renderVariantCard renders one DraftVariant inside a rounded card.
+// num <= 0 hides the leading number chip — used for the single-variant
+// preview where there's nothing to choose between.
 func renderVariantCard(num int, v embed.DraftVariant) string {
-	key := keyChip.Render(itoa(num))
 	title := lipgloss.NewStyle().Foreground(colorBrand).Bold(true).
 		Render(strings.TrimSpace(v.Title))
+	titleLine := title
+	if num > 0 {
+		titleLine = keyChip.Render(itoa(num)) + "  " + title
+	}
 
 	body := textBody.Render(strings.TrimSpace(v.Body))
 
@@ -397,7 +398,7 @@ func renderVariantCard(num int, v embed.DraftVariant) string {
 		MarginBottom(1)
 
 	inner := lipgloss.JoinVertical(lipgloss.Left,
-		key+"  "+title,
+		titleLine,
 		"",
 		body,
 		"",
