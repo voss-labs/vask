@@ -1244,3 +1244,267 @@ func nullID(p *int64) any {
 	}
 	return *p
 }
+
+// === operator stats ====================================================
+
+// Stats is the operator-console snapshot read by `vask-mod stats`. Counts
+// are split between "real" and "seed" so the operator can distinguish
+// genuine community activity from the deploy seed. Seed users carry the
+// `seed-` fingerprint prefix written by cmd/vask-seed.
+type Stats struct {
+	// Cumulative
+	RealUsers      int
+	SeedUsers      int
+	DeletedUsers   int // tombstoned (deleted_at NOT NULL)
+	RealPosts      int
+	SeedPosts      int
+	HiddenPosts    int
+	RealComments   int
+	HiddenComments int
+	PostVotes      int
+	CommentVotes   int
+
+	// Rolling window (rows where created_at >= Since.Unix())
+	Since                  time.Time
+	NewUsersWindow         int
+	NewRealPostsWindow     int
+	NewRealCommentsWindow  int
+	UniquePostersWindow    int
+	UniqueCommentersWindow int
+}
+
+// PostStats wraps Post with admin-only counters that aren't shown in
+// the regular feed. ViewCount is sourced from post_views (distinct
+// users who opened the post).
+type PostStats struct {
+	Post
+	ViewCount int
+}
+
+// PostsWithStats returns posts ordered by sortBy ("views", "score",
+// "comments", "new") with a window filter and optional seed filter.
+// Used by `vask-mod top-posts` and `vask-mod recent-posts`.
+func (s *Store) PostsWithStats(ctx context.Context, since time.Time, limit int, sortBy string, includeSeeds bool) ([]PostStats, error) {
+	if limit <= 0 || limit > 200 {
+		limit = 20
+	}
+	order := "p.created_at DESC"
+	switch sortBy {
+	case "views":
+		order = "view_count DESC, p.created_at DESC"
+	case "score":
+		order = "score DESC, p.created_at DESC"
+	case "comments":
+		order = "comment_count DESC, p.created_at DESC"
+	case "new":
+		order = "p.created_at DESC"
+	}
+	seedClause := "AND u.fingerprint_hash NOT LIKE 'seed-%'"
+	if includeSeeds {
+		seedClause = ""
+	}
+	q := `
+SELECT p.id, p.user_id, COALESCE(u.username, ''), COALESCE(p.channel, ''),
+       p.title, p.body, p.created_at, p.hidden,
+       (SELECT COALESCE(SUM(value),0) FROM post_votes WHERE post_id = p.id)         AS score,
+       (SELECT COUNT(*) FROM comments WHERE post_id = p.id AND hidden = 0)          AS comment_count,
+       (SELECT COUNT(*) FROM post_views WHERE post_id = p.id)                       AS view_count,
+       (SELECT COALESCE(GROUP_CONCAT(tag, ','), '') FROM post_tags WHERE post_id = p.id) AS tags_csv
+FROM posts p
+LEFT JOIN users u ON u.id = p.user_id
+WHERE p.created_at >= ? ` + seedClause + `
+ORDER BY ` + order + `
+LIMIT ?`
+	rows, err := s.db.QueryContext(ctx, q, since.Unix(), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []PostStats
+	for rows.Next() {
+		var ps PostStats
+		var createdAt int64
+		var hidden int
+		var tagsCSV string
+		if err := rows.Scan(&ps.ID, &ps.UserID, &ps.Username, &ps.Channel,
+			&ps.Title, &ps.Body, &createdAt, &hidden,
+			&ps.Score, &ps.CommentCount, &ps.ViewCount, &tagsCSV); err != nil {
+			return nil, err
+		}
+		ps.CreatedAt = time.Unix(createdAt, 0)
+		ps.Hidden = hidden == 1
+		ps.Tags = splitCSV(tagsCSV)
+		out = append(out, ps)
+	}
+	return out, rows.Err()
+}
+
+// ActiveUser is a row in the `vask-mod users --active` listing — a real
+// user who posted, commented, or voted in the window.
+type ActiveUser struct {
+	UserID    int64
+	Username  string
+	Posts     int
+	Comments  int
+	Votes     int
+	LastSeen  time.Time
+}
+
+// ActiveUsers returns real (non-seed, non-deleted) users who did at
+// least one of {post, comment, vote} in the window, with per-user
+// activity counters.
+func (s *Store) ActiveUsers(ctx context.Context, since time.Time, limit int) ([]ActiveUser, error) {
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	const q = `
+SELECT u.id, COALESCE(u.username, ''),
+       (SELECT COUNT(*) FROM posts    WHERE user_id = u.id AND created_at >= ?) AS posts,
+       (SELECT COUNT(*) FROM comments WHERE user_id = u.id AND created_at >= ?) AS comments,
+       (SELECT COUNT(*) FROM post_votes    WHERE user_id = u.id AND created_at >= ?)
+       + (SELECT COUNT(*) FROM comment_votes WHERE user_id = u.id AND created_at >= ?) AS votes,
+       MAX(COALESCE((SELECT MAX(created_at) FROM posts    WHERE user_id = u.id), 0),
+           COALESCE((SELECT MAX(created_at) FROM comments WHERE user_id = u.id), 0),
+           COALESCE((SELECT MAX(created_at) FROM post_votes    WHERE user_id = u.id), 0),
+           COALESCE((SELECT MAX(created_at) FROM comment_votes WHERE user_id = u.id), 0)) AS last_seen
+FROM users u
+WHERE u.deleted_at IS NULL
+  AND u.fingerprint_hash NOT LIKE 'seed-%'
+  AND ((SELECT COUNT(*) FROM posts    WHERE user_id = u.id AND created_at >= ?) > 0
+    OR (SELECT COUNT(*) FROM comments WHERE user_id = u.id AND created_at >= ?) > 0
+    OR (SELECT COUNT(*) FROM post_votes    WHERE user_id = u.id AND created_at >= ?) > 0
+    OR (SELECT COUNT(*) FROM comment_votes WHERE user_id = u.id AND created_at >= ?) > 0)
+ORDER BY last_seen DESC
+LIMIT ?`
+	t := since.Unix()
+	rows, err := s.db.QueryContext(ctx, q, t, t, t, t, t, t, t, t, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ActiveUser
+	for rows.Next() {
+		var u ActiveUser
+		var lastSeen int64
+		if err := rows.Scan(&u.UserID, &u.Username, &u.Posts, &u.Comments, &u.Votes, &lastSeen); err != nil {
+			return nil, err
+		}
+		u.LastSeen = time.Unix(lastSeen, 0)
+		out = append(out, u)
+	}
+	return out, rows.Err()
+}
+
+// FeedEvent is a single row in the `vask-mod watch` live tail —
+// either a new post or a new comment. Votes are intentionally excluded
+// (high-frequency, low-signal). Returned in created_at order.
+type FeedEvent struct {
+	Kind      string // "post" or "comment"
+	ID        int64
+	UserID    int64
+	Username  string
+	PostID    int64  // for comments, the parent post; for posts, equals ID
+	Title     string // post title (or parent post title for comments)
+	Snippet   string // first ~80 chars of body
+	CreatedAt time.Time
+	IsSeed    bool
+}
+
+// EventsSince returns posts and comments created strictly after the
+// given ids. The caller passes max(id) of the last batch and gets
+// only newer rows back. Used by `vask-mod watch` polling.
+func (s *Store) EventsSince(ctx context.Context, sincePostID, sinceCommentID int64, limit int) ([]FeedEvent, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 50
+	}
+	const q = `
+SELECT 'post' AS kind, p.id, p.user_id, COALESCE(u.username, ''), p.id AS post_id,
+       p.title, substr(p.body, 1, 80), p.created_at,
+       (CASE WHEN u.fingerprint_hash LIKE 'seed-%' THEN 1 ELSE 0 END) AS is_seed
+FROM posts p LEFT JOIN users u ON u.id = p.user_id
+WHERE p.id > ?
+UNION ALL
+SELECT 'comment' AS kind, c.id, c.user_id, COALESCE(u.username, ''), c.post_id,
+       (SELECT title FROM posts WHERE id = c.post_id), substr(c.body, 1, 80), c.created_at,
+       (CASE WHEN u.fingerprint_hash LIKE 'seed-%' THEN 1 ELSE 0 END) AS is_seed
+FROM comments c LEFT JOIN users u ON u.id = c.user_id
+WHERE c.id > ?
+ORDER BY 8 ASC
+LIMIT ?`
+	rows, err := s.db.QueryContext(ctx, q, sincePostID, sinceCommentID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []FeedEvent
+	for rows.Next() {
+		var e FeedEvent
+		var createdAt int64
+		var isSeed int
+		if err := rows.Scan(&e.Kind, &e.ID, &e.UserID, &e.Username, &e.PostID,
+			&e.Title, &e.Snippet, &createdAt, &isSeed); err != nil {
+			return nil, err
+		}
+		e.CreatedAt = time.Unix(createdAt, 0)
+		e.IsSeed = isSeed == 1
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// MaxEventIDs returns the current maximum post.id and comment.id —
+// the watch loop calls this once at startup to skip historical rows.
+func (s *Store) MaxEventIDs(ctx context.Context) (postID, commentID int64, err error) {
+	row := s.db.QueryRowContext(ctx, `SELECT
+        COALESCE((SELECT MAX(id) FROM posts), 0),
+        COALESCE((SELECT MAX(id) FROM comments), 0)`)
+	err = row.Scan(&postID, &commentID)
+	return
+}
+
+// Stats returns the operator-console snapshot in a single round-trip
+// (one big SELECT with subquery aggregates). Cheap on Turso even from
+// a far region because it's one network hop instead of ten.
+func (s *Store) Stats(ctx context.Context, since time.Time) (*Stats, error) {
+	const q = `
+SELECT
+  (SELECT COUNT(*) FROM users WHERE fingerprint_hash NOT LIKE 'seed-%' AND deleted_at IS NULL),
+  (SELECT COUNT(*) FROM users WHERE fingerprint_hash LIKE 'seed-%'),
+  (SELECT COUNT(*) FROM users WHERE deleted_at IS NOT NULL),
+  (SELECT COUNT(*) FROM posts p JOIN users u ON u.id=p.user_id
+     WHERE p.hidden=0 AND u.fingerprint_hash NOT LIKE 'seed-%'),
+  (SELECT COUNT(*) FROM posts p JOIN users u ON u.id=p.user_id
+     WHERE u.fingerprint_hash LIKE 'seed-%'),
+  (SELECT COUNT(*) FROM posts WHERE hidden=1),
+  (SELECT COUNT(*) FROM comments c JOIN users u ON u.id=c.user_id
+     WHERE c.hidden=0 AND u.fingerprint_hash NOT LIKE 'seed-%'),
+  (SELECT COUNT(*) FROM comments WHERE hidden=1),
+  (SELECT COUNT(*) FROM post_votes),
+  (SELECT COUNT(*) FROM comment_votes),
+  (SELECT COUNT(*) FROM users WHERE created_at >= ? AND fingerprint_hash NOT LIKE 'seed-%'),
+  (SELECT COUNT(*) FROM posts p JOIN users u ON u.id=p.user_id
+     WHERE p.created_at >= ? AND u.fingerprint_hash NOT LIKE 'seed-%' AND p.hidden=0),
+  (SELECT COUNT(*) FROM comments c JOIN users u ON u.id=c.user_id
+     WHERE c.created_at >= ? AND u.fingerprint_hash NOT LIKE 'seed-%' AND c.hidden=0),
+  (SELECT COUNT(DISTINCT p.user_id) FROM posts p JOIN users u ON u.id=p.user_id
+     WHERE p.created_at >= ? AND u.fingerprint_hash NOT LIKE 'seed-%' AND p.hidden=0),
+  (SELECT COUNT(DISTINCT c.user_id) FROM comments c JOIN users u ON u.id=c.user_id
+     WHERE c.created_at >= ? AND u.fingerprint_hash NOT LIKE 'seed-%' AND c.hidden=0)
+`
+	sinceUnix := since.Unix()
+	row := s.db.QueryRowContext(ctx, q,
+		sinceUnix, sinceUnix, sinceUnix, sinceUnix, sinceUnix)
+	var st Stats
+	st.Since = since
+	if err := row.Scan(
+		&st.RealUsers, &st.SeedUsers, &st.DeletedUsers,
+		&st.RealPosts, &st.SeedPosts, &st.HiddenPosts,
+		&st.RealComments, &st.HiddenComments,
+		&st.PostVotes, &st.CommentVotes,
+		&st.NewUsersWindow, &st.NewRealPostsWindow, &st.NewRealCommentsWindow,
+		&st.UniquePostersWindow, &st.UniqueCommentersWindow,
+	); err != nil {
+		return nil, fmt.Errorf("stats: %w", err)
+	}
+	return &st, nil
+}
