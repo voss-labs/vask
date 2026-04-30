@@ -19,11 +19,6 @@ on:
 # Default to no permissions; jobs grant only what they need.
 permissions: {}
 
-# upload-artifact / download-artifact at v4 are still Node 20-based;
-# this env var opts them into the Node 24 runtime to silence deprecation.
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
-
 jobs:
   test:
     if: github.repository == 'voss-labs/vask'
