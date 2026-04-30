@@ -52,7 +52,10 @@ func (c *Client) Draft(ctx context.Context, dilemma string) ([]DraftVariant, err
 			{"role": "system", "content": draftSystem},
 			{"role": "user", "content": dilemma},
 		},
-		"max_tokens":  600,
+		// gemma-4 is a reasoning model — it spends most of max_tokens on
+		// internal "thinking" before emitting visible output. 4000 leaves
+		// room for ~3000 reasoning tokens + ~1000 for the JSON we want.
+		"max_tokens":  4000,
 		"temperature": 0.8,
 	})
 	url := "https://api.cloudflare.com/client/v4/accounts/" + c.accountID +
@@ -107,8 +110,12 @@ func (c *Client) Draft(ctx context.Context, dilemma string) ([]DraftVariant, err
 	start := strings.Index(raw, "[")
 	end := strings.LastIndex(raw, "]")
 	if start < 0 || end <= start {
+		// Dump the FULL CF body, not just result.response — if the model
+		// puts content in a different field (reasoning, choices, etc.)
+		// we need to see it to know what to parse.
 		slog.Error("draft no json array",
-			"response", truncate(raw, 480))
+			"response", truncate(raw, 480),
+			"raw_body", truncate(string(rawBody), 1200))
 		return nil, fmt.Errorf("draft: no json array in model output: %s",
 			truncate(raw, 240))
 	}
