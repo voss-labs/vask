@@ -32,6 +32,16 @@ Posts that violate these rules are hidden by the operating instance's moderators
 - Every moderator action lands in `moderation_actions` with the moderator's user ID and a reason. Audit trail is part of the schema.
 - Reporters are visible to moderators only, never to post authors.
 
+## Leaving — deleting your account
+
+Open the activity overlay (press `Y` on the feed), then `D` to delete. You'll be asked to type `delete <your-handle>` to confirm. On success:
+
+- Your username is cleared and your fingerprint hash is replaced with a tombstone — the same SSH key can never re-claim that account.
+- Your posts and comments **stay** (they fall back to anonymous `anony-NNNN` labels), so threads other people are still in don't get gutted.
+- Reconnecting with the same key creates a brand-new, unrelated account.
+
+Want the content gone too? Use the feed's `m` filter (mine-only) and `d D` on each post/comment to delete them individually first, then delete your account.
+
 ## Audit
 
 The repo is open source. Any privacy claim above can be verified by reading the code. The two files that carry the load:

@@ -4,8 +4,10 @@ package store
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
 	_ "embed"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -35,6 +37,9 @@ var schema005 string
 
 //go:embed migrations/006_embedding.sql
 var schema006 string
+
+//go:embed migrations/007_account_deletion.sql
+var schema007 string
 
 type Store struct {
 	db    *sql.DB
@@ -98,7 +103,7 @@ func (s *Store) migrate() error {
 		sql     string
 	}{
 		{2, schema002}, {3, schema003}, {4, schema004},
-		{5, schema005}, {6, schema006},
+		{5, schema005}, {6, schema006}, {7, schema007},
 	}
 	for _, m := range rest {
 		if applied[m.version] {
@@ -202,6 +207,28 @@ func (s *Store) AcceptTOS(ctx context.Context, userID int64) error {
 		`UPDATE users SET tos_accepted_at = ? WHERE id = ? AND tos_accepted_at IS NULL`,
 		time.Now().Unix(), userID,
 	)
+	return err
+}
+
+// DeleteOwnAccount soft-deletes the user: tombstones their fingerprint
+// (so the same SSH key can never re-claim this user_id) and nulls out
+// their handle. Their posts and comments stay — they fall back to
+// "anony-NNNN" via displayName because the JOIN on users now sees a
+// NULL username. Idempotent: re-running on an already-deleted row is
+// a no-op (the WHERE deleted_at IS NULL guard).
+func (s *Store) DeleteOwnAccount(ctx context.Context, userID int64) error {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Errorf("delete account: rand: %w", err)
+	}
+	tomb := "deleted-" + hex.EncodeToString(b[:])
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE users
+		SET deleted_at = ?,
+		    username = NULL,
+		    fingerprint_hash = ?
+		WHERE id = ? AND deleted_at IS NULL`,
+		time.Now().Unix(), tomb, userID)
 	return err
 }
 

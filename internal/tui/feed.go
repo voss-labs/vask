@@ -37,10 +37,11 @@ type feedModel struct {
 	mineOnly    bool
 
 	// overlay sub-state
-	overlay         feedOverlay
-	searchInput     textinput.Model
-	popularTags     []string
-	activityPosts   []store.Post            // your last N authored posts
+	overlay          feedOverlay
+	searchInput      textinput.Model
+	deleteInput      textinput.Model
+	popularTags      []string
+	activityPosts    []store.Post            // your last N authored posts
 	activityComments []store.ActivityComment // your last N authored comments (with parent titles)
 
 	// data
@@ -70,6 +71,7 @@ const (
 	overlayTagPicker
 	overlayInfo
 	overlayActivity
+	overlayDeleteConfirm
 )
 
 // pageSize is the post-fetch limit per page. 100 covers nearly every
@@ -114,6 +116,10 @@ type activityLoadedMsg struct {
 	comments []store.ActivityComment
 }
 
+type accountDeletedMsg struct {
+	err error
+}
+
 // === ctor ================================================================
 
 func newFeed(st *store.Store, user *store.User) feedModel {
@@ -124,12 +130,20 @@ func newFeed(st *store.Store, user *store.User) feedModel {
 	si.CharLimit = 80
 	si.Cursor.Style = lipgloss.NewStyle().Foreground(colorBrand)
 
+	di := textinput.New()
+	di.Placeholder = "type 'delete <your-handle>' to confirm"
+	di.Width = ContentWidth - 4
+	di.Prompt = ""
+	di.CharLimit = 80
+	di.Cursor.Style = lipgloss.NewStyle().Foreground(colorBrandDeep)
+
 	return feedModel{
 		st:               st,
 		user:             user,
 		sort:             store.SortHot,
 		pendingDeleteIdx: -1,
 		searchInput:      si,
+		deleteInput:      di,
 	}
 }
 
@@ -213,6 +227,14 @@ func loadActivity(st *store.Store, userID int64) tea.Cmd {
 		})
 		comments, _ := st.MyRecentComments(ctx, userID, 5)
 		return activityLoadedMsg{posts: posts, comments: comments}
+	}
+}
+
+func deleteAccountCmd(st *store.Store, userID int64) tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+		defer cancel()
+		return accountDeletedMsg{err: st.DeleteOwnAccount(ctx, userID)}
 	}
 }
 
@@ -310,6 +332,15 @@ func (m feedModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.flash = "post deleted."
 		return m, m.reloadAndCount()
 
+	case accountDeletedMsg:
+		if msg.err != nil {
+			m.flash = "couldn't delete account: " + msg.err.Error()
+			return m, nil
+		}
+		// success: terminate the SSH session. The user is now tombstoned;
+		// reconnecting with the same key creates a fresh, unrelated account.
+		return m, tea.Quit
+
 	case tea.KeyMsg:
 		// route keys to whichever overlay is active
 		switch m.overlay {
@@ -323,6 +354,8 @@ func (m feedModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.handleInfoKey(msg)
 		case overlayActivity:
 			return m.handleActivityKey(msg)
+		case overlayDeleteConfirm:
+			return m.handleDeleteConfirmKey(msg)
 		}
 		return m.handleMainKey(msg)
 	}
@@ -581,6 +614,11 @@ func (m feedModel) handleActivityKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "Y", "esc", "q":
 		m.overlay = overlayNone
 		return m, nil
+	case "D":
+		// switch into the delete-account confirm overlay
+		m.overlay = overlayDeleteConfirm
+		m.deleteInput.SetValue("")
+		return m, m.deleteInput.Focus()
 	}
 	// Digits map to flat ordinal: posts first, then comments. Pressing the
 	// digit jumps to the underlying post (for a comment, that's its parent).
@@ -599,6 +637,32 @@ func (m feedModel) handleActivityKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 	return m, nil
+}
+
+// handleDeleteConfirmKey owns the "type 'delete <handle>' to confirm"
+// overlay. esc returns to activity. enter validates the typed phrase and
+// either fires the delete command or flashes a friendly mismatch error.
+func (m feedModel) handleDeleteConfirmKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+c":
+		return m, tea.Quit
+	case "esc":
+		m.overlay = overlayActivity
+		m.deleteInput.Blur()
+		m.flash = ""
+		return m, nil
+	case "enter":
+		want := "delete " + m.user.Username
+		got := strings.TrimSpace(m.deleteInput.Value())
+		if got != want {
+			m.flash = "phrase didn't match. esc to back out."
+			return m, nil
+		}
+		return m, deleteAccountCmd(m.st, m.user.ID)
+	}
+	var cmd tea.Cmd
+	m.deleteInput, cmd = m.deleteInput.Update(msg)
+	return m, cmd
 }
 
 // reloadAndCount fires both a fresh page-load and a count refresh — used
@@ -649,6 +713,8 @@ func (m feedModel) View() string {
 		return frameStyle.Render(m.viewTagPickerOverlay())
 	case overlayActivity:
 		return frameStyle.Render(m.viewActivityOverlay())
+	case overlayDeleteConfirm:
+		return frameStyle.Render(m.viewDeleteConfirmOverlay())
 	}
 
 	header := renderFeedHeader(m.user, m.sort, len(m.posts), m.total, m.page,
@@ -1065,6 +1131,7 @@ func renderFeedHelp() string {
 		{"about", [][2]string{
 			{"i", "what is voss / vask?"},
 			{"Y", "your activity (recent posts + comments)"},
+			{"Y → D", "delete your account"},
 		}},
 		{"session", [][2]string{
 			{"q / ctrl+c", "quit"},
@@ -1262,7 +1329,9 @@ func (m feedModel) viewActivityOverlay() string {
 
 	footer := footerStyle.Render(
 		lipgloss.NewStyle().Width(ContentWidth).Align(lipgloss.Center).Render(
-			renderKey("1-9", "jump")+renderKeySep()+renderKey("esc", "close"),
+			renderKey("1-9", "jump")+renderKeySep()+
+				renderKey("D", "delete account")+renderKeySep()+
+				renderKey("esc", "close"),
 		),
 	)
 
@@ -1278,6 +1347,55 @@ func (m feedModel) viewActivityOverlay() string {
 		footer,
 	)
 	return body
+}
+
+// viewDeleteConfirmOverlay is the typed-confirmation gate for account
+// deletion. Behaviour intentionally mirrors GitHub's "type the repo name
+// to delete" pattern: a single keystroke is too easy to fat-finger when
+// the action is irreversible.
+func (m feedModel) viewDeleteConfirmOverlay() string {
+	header := headerStyle.Render(
+		brandText.Render("voss") + textMute.Render(" / ") + brandText.Render("vask") +
+			"  " + textDim.Render("delete account"),
+	)
+	warn := lipgloss.NewStyle().Foreground(colorBrandDeep).Bold(true).
+		Render("⚠ this disconnects your ssh key from this account.")
+	body := textBody.Render(
+		"your posts and comments stay (anonymised). reconnecting with the\n" +
+			"same key creates a brand-new, unrelated account.\n" +
+			"\n" +
+			"this is final — there's no undo.")
+	prompt := textDim.Render(`to confirm, type:  `) +
+		lipgloss.NewStyle().Foreground(colorBrand).Bold(true).
+			Render("delete "+m.user.Username)
+	box := formBoxFocused.Render(m.deleteInput.View())
+
+	flashLine := ""
+	if m.flash != "" {
+		flashLine = textErr.Render("✗ " + m.flash)
+	}
+
+	footer := footerStyle.Render(
+		lipgloss.NewStyle().Width(ContentWidth).Align(lipgloss.Center).Render(
+			renderKey("⏎", "delete forever")+renderKeySep()+
+				renderKey("esc", "cancel"),
+		),
+	)
+	return lipgloss.JoinVertical(
+		lipgloss.Left,
+		header,
+		"",
+		warn,
+		"",
+		body,
+		"",
+		prompt,
+		"",
+		box,
+		flashLine,
+		"",
+		footer,
+	)
 }
 
 func (m feedModel) viewTagPickerOverlay() string {
