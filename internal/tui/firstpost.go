@@ -303,15 +303,14 @@ func (m firstpostModel) viewDilemma() string {
 
 func (m firstpostModel) viewLoading() string {
 	header := brandText.Render("drafting…")
-	tagline := textDim.Render("reasoning model · usually 30-60 seconds")
+	tagline := textDim.Render("usually 15-30 seconds")
 
 	rule := lipgloss.NewStyle().Foreground(colorBorder).
 		Render(strings.Repeat("─", ContentWidth-4))
 
 	body := textBody.Render(
-		"sit tight. gemma-4 is thinking through two short anonymous\n" +
-			"variants of your line — different angles on the same situation.\n" +
-			"reasoning models trade speed for quality, so this is the slow part.",
+		"sit tight. drafting two short anonymous variants of your line —\n" +
+			"different angles on the same situation.",
 	)
 
 	hint := textMute.Render("ctrl+c to quit")

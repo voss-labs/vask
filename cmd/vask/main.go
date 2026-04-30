@@ -48,6 +48,15 @@ ssh key on this device yet. one-time setup:
 then retry: ssh vask.vosslabs.org
 your key never leaves your machine — vask only reads sha256(pubkey).
 
+re-testing? to forget vask's host key on this machine and get the
+"first connection" prompt again, run:
+
+    ssh-keygen -R vask.vosslabs.org
+
+note: this only resets your ssh client's host key cache. to truly
+start fresh as a new vask user, the in-app deletion is the only path —
+press Y on the feed, then D, and confirm.
+
 `
 
 func main() {

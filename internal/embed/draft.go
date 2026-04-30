@@ -22,13 +22,14 @@ type DraftVariant struct {
 // draftSystem is the model contract. Tweak this string and the entire
 // vibe of AI-drafted posts changes — keep it tight, opinionated, and
 // loud about the "no names" rule because the model will obey if asked.
-const draftSystem = `you write short anonymous campus-forum posts in the voice of an indian college student. follow every rule:
+const draftSystem = `you write very short anonymous campus-forum posts in the voice of an indian college student. follow every rule:
 
 - lowercase only, no emojis, no markdown
 - no real names of people, professors, companies, brands, products, places, or apps. if the user mentions one, replace with a generic description (eg "the OS prof", "a guy from cs-a", "a tier-1 product company")
-- title under 80 chars, body 30-80 words
-- end the body with a real question that invites replies
-- casual student tone, sparing use of "ngl", "tbh", "honestly", "anyone else", "wait"
+- title: 4-8 words, punchy
+- body: 1-2 sentences MAX, 15-25 words total. tight. no setup paragraphs.
+- lead with the feeling or the take, end with one real question that invites replies
+- casual student tone. drop "ngl", "tbh", "honestly", "anyone else", "wait" naturally — sparingly
 - the user is asking, not advising
 
 return only a json array of two variants — different angles on the same situation:
@@ -52,9 +53,10 @@ func (c *Client) Draft(ctx context.Context, dilemma string) ([]DraftVariant, err
 			{"role": "system", "content": draftSystem},
 			{"role": "user", "content": dilemma},
 		},
-		// gemma-4 is a reasoning model — it spends most of max_tokens on
-		// internal "thinking" before emitting visible output. 4000 leaves
-		// room for ~3000 reasoning tokens + ~1000 for the JSON we want.
+		// gemma-4 is a reasoning model — most of max_tokens goes to
+		// internal "thinking" tokens before any visible JSON. At 600
+		// it hits finish_reason=length with content=null. 4000 leaves
+		// ~2000-3000 reasoning + ~500 JSON output. cURL clocks ~26s.
 		"max_tokens":  4000,
 		"temperature": 0.8,
 	})
@@ -85,12 +87,23 @@ func (c *Client) Draft(ctx context.Context, dilemma string) ([]DraftVariant, err
 			resp.StatusCode, truncate(string(b), 240))
 	}
 
+	// CF Workers AI returns two different shapes depending on the model:
+	//   - Legacy flat format (llama-3.1, older models): result.response is a string
+	//   - OpenAI Chat Completions (gemma-4, llama-4, gpt-oss, kimi, etc.):
+	//     result.choices[0].message.content holds the string
+	// We read both. raw becomes whichever one is populated.
 	var parsed struct {
 		Result struct {
 			Response string `json:"response"`
+			Choices  []struct {
+				Message struct {
+					Content string `json:"content"`
+				} `json:"message"`
+				FinishReason string `json:"finish_reason"`
+			} `json:"choices"`
 		} `json:"result"`
-		Success bool     `json:"success"`
-		Errors  []any    `json:"errors"`
+		Success bool  `json:"success"`
+		Errors  []any `json:"errors"`
 	}
 	rawBody, _ := io.ReadAll(resp.Body)
 	if err := json.Unmarshal(rawBody, &parsed); err != nil {
@@ -106,7 +119,15 @@ func (c *Client) Draft(ctx context.Context, dilemma string) ([]DraftVariant, err
 
 	// the model occasionally wraps the JSON in prose ("here's your variants:")
 	// — extract the first [ ... ] balanced span before unmarshalling.
+	// CF Workers AI returns the text in different fields depending on the
+	// model: older flat shape uses result.response, newer OpenAI-compatible
+	// shape (gemma-4, llama-4, gpt-oss, kimi, etc.) uses
+	// result.choices[0].message.content. Fall back to choices when response
+	// is empty so a single parser handles both.
 	raw := parsed.Result.Response
+	if raw == "" && len(parsed.Result.Choices) > 0 {
+		raw = parsed.Result.Choices[0].Message.Content
+	}
 	start := strings.Index(raw, "[")
 	end := strings.LastIndex(raw, "]")
 	if start < 0 || end <= start {

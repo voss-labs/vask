@@ -791,7 +791,7 @@ func (m composeModel) viewDrafter() string {
 		)
 	case drafterLoading:
 		bodyBlock = textBody.Render(
-			"gemma-4 is thinking · reasoning model · 30-60 seconds…",
+			"drafting two short anonymous variants · usually 15-30 seconds…",
 		)
 	case drafterPick:
 		cards := make([]string, 0, len(m.drafterVariants))
