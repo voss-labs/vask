@@ -140,3 +140,14 @@ func renderKey(k, label string) string {
 func renderKeySep() string {
 	return textMute.Render("   ")
 }
+
+// hyperlink wraps text in an OSC 8 escape so terminals that support it
+// (iTerm2, Terminal.app, kitty, alacritty, wezterm, ghostty, modern
+// Windows Terminal) render the text as a clickable link to url. Older
+// terminals just display the plain text — the escape bytes are
+// consumed silently. Width-counting ANSI strippers treat OSC sequences
+// the same as SGR, so lipgloss centering still measures the visible
+// text correctly.
+func hyperlink(url, text string) string {
+	return "\x1b]8;;" + url + "\x1b\\" + text + "\x1b]8;;\x1b\\"
+}

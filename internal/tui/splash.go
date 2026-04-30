@@ -48,44 +48,41 @@ func (m splashModel) View() string {
 
 	rule := lipgloss.NewStyle().
 		Foreground(colorBorder).
-		Render("──────────────────────────────────────────────")
+		Render("──────────────────────────────────────")
 
-	intro := textBody.Render(
-		"your ssh key is hashed (sha256) and used only to give you a\n" +
-			"stable identity for rate-limiting and ban management. no\n" +
-			"email, no real name, no IP logged. your posts and votes\n" +
-			"are never linked to your key in any public view.",
+	privacy := textMute.Render(
+		"anonymous · no email, no real name, no ip stored",
 	)
 
-	rulesTitle := textDim.Render("rules")
-	rules := textBody.Render(
-		"  • no real names. initials or descriptions are fine.\n" +
-			"  • no phone numbers, social handles, schedules.\n" +
-			"  • no targeted harassment, doxxing, or revenge posts.\n" +
-			"  • stay on-topic for the channel you post in.",
-	)
+	// Each pitch line is its own string so JoinVertical(Center, ...)
+	// centers them individually — keeps the whole splash visually
+	// symmetric, no bulleted block looking left-shifted next to a
+	// centered heading.
+	pitch := []string{
+		textBody.Render("for the questions you can't ask on linkedin or insta —"),
+		textBody.Render("internships, placements, ml vs ds, courses you're"),
+		textBody.Render("behind in, group-project drama, anything weighing on you."),
+		"",
+		textBody.Render("post once. people reply. you check back tomorrow."),
+		textBody.Render("nobody knows it's you."),
+	}
 
-	source := textMute.Render("audit the code: github.com/voss-labs/vask")
+	rulesTitle := textDim.Render("ground rules")
+	rules := []string{
+		textBody.Render("no real names · no phone numbers · no socials"),
+		textBody.Render("no doxxing · no targeted harassment"),
+	}
 
+	source := textMute.Render("audit the code: ") +
+		hyperlink("https://github.com/voss-labs/vask",
+			textMute.Render("github.com/voss-labs/vask"))
 	cta := textDim.Render("press ") + keyChip.Render("any key") + textDim.Render(" to continue")
 
-	body := lipgloss.JoinVertical(
-		lipgloss.Center,
-		mark,
-		"",
-		title,
-		tagline,
-		rule,
-		"",
-		intro,
-		"",
-		rulesTitle,
-		rules,
-		"",
-		source,
-		"",
-		cta,
-	)
+	parts := []string{mark, "", title, tagline, rule, "", privacy, ""}
+	parts = append(parts, pitch...)
+	parts = append(parts, "", rulesTitle)
+	parts = append(parts, rules...)
+	parts = append(parts, "", source, "", cta)
 
-	return frameStyle.Render(body)
+	return frameStyle.Render(lipgloss.JoinVertical(lipgloss.Center, parts...))
 }
