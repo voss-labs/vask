@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 )
@@ -45,6 +46,7 @@ func (c *Client) Draft(ctx context.Context, dilemma string) ([]DraftVariant, err
 	if c == nil {
 		return nil, ErrNotConfigured
 	}
+	slog.Info("draft start", "model", draftModel, "dilemma_len", len(dilemma))
 	body, _ := json.Marshal(map[string]any{
 		"messages": []map[string]string{
 			{"role": "system", "content": draftSystem},
@@ -57,6 +59,7 @@ func (c *Client) Draft(ctx context.Context, dilemma string) ([]DraftVariant, err
 		"/ai/run/" + draftModel
 	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
 	if err != nil {
+		slog.Error("draft new request", "err", err)
 		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+c.token)
@@ -64,12 +67,17 @@ func (c *Client) Draft(ctx context.Context, dilemma string) ([]DraftVariant, err
 
 	resp, err := c.httpc.Do(req)
 	if err != nil {
+		slog.Error("draft http", "err", err)
 		return nil, fmt.Errorf("draft: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(resp.Body)
+		slog.Error("draft non-200",
+			"status", resp.StatusCode,
+			"body", truncate(string(b), 480),
+			"model", draftModel)
 		return nil, fmt.Errorf("draft: cloudflare returned %d: %s",
 			resp.StatusCode, truncate(string(b), 240))
 	}
@@ -78,12 +86,18 @@ func (c *Client) Draft(ctx context.Context, dilemma string) ([]DraftVariant, err
 		Result struct {
 			Response string `json:"response"`
 		} `json:"result"`
-		Success bool `json:"success"`
+		Success bool     `json:"success"`
+		Errors  []any    `json:"errors"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
+	rawBody, _ := io.ReadAll(resp.Body)
+	if err := json.Unmarshal(rawBody, &parsed); err != nil {
+		slog.Error("draft decode", "err", err, "body", truncate(string(rawBody), 480))
 		return nil, fmt.Errorf("draft: decode: %w", err)
 	}
 	if !parsed.Success {
+		slog.Error("draft success=false",
+			"errors", parsed.Errors,
+			"body", truncate(string(rawBody), 480))
 		return nil, fmt.Errorf("draft: cloudflare returned success=false")
 	}
 
@@ -93,16 +107,23 @@ func (c *Client) Draft(ctx context.Context, dilemma string) ([]DraftVariant, err
 	start := strings.Index(raw, "[")
 	end := strings.LastIndex(raw, "]")
 	if start < 0 || end <= start {
+		slog.Error("draft no json array",
+			"response", truncate(raw, 480))
 		return nil, fmt.Errorf("draft: no json array in model output: %s",
 			truncate(raw, 240))
 	}
 	var variants []DraftVariant
 	if err := json.Unmarshal([]byte(raw[start:end+1]), &variants); err != nil {
+		slog.Error("draft parse variants",
+			"err", err,
+			"response", truncate(raw, 480))
 		return nil, fmt.Errorf("draft: parse variants: %w (raw=%s)",
 			err, truncate(raw, 240))
 	}
 	if len(variants) == 0 {
+		slog.Error("draft empty variants", "response", truncate(raw, 480))
 		return nil, fmt.Errorf("draft: model returned empty variants array")
 	}
+	slog.Info("draft ok", "variants", len(variants))
 	return variants, nil
 }

@@ -444,7 +444,7 @@ func (m composeModel) drafterCmd(dilemma string) tea.Cmd {
 		if client == nil {
 			return composeDrafterVariantsMsg{err: embed.ErrNotConfigured}
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 		defer cancel()
 		v, err := client.Draft(ctx, dilemma)
 		return composeDrafterVariantsMsg{variants: v, err: err}
@@ -791,7 +791,7 @@ func (m composeModel) viewDrafter() string {
 		)
 	case drafterLoading:
 		bodyBlock = textBody.Render(
-			"asking gemma-4 for two short anonymous variants · 5-15 seconds…",
+			"gemma-4 is thinking · reasoning model · 30-60 seconds…",
 		)
 	case drafterPick:
 		cards := make([]string, 0, len(m.drafterVariants))

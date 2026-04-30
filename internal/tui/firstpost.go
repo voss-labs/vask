@@ -184,7 +184,7 @@ func (m firstpostModel) draftCmd(dilemma string) tea.Cmd {
 		if client == nil {
 			return firstpostVariantsMsg{err: embed.ErrNotConfigured}
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 		defer cancel()
 		v, err := client.Draft(ctx, dilemma)
 		return firstpostVariantsMsg{variants: v, err: err}
@@ -259,6 +259,15 @@ func (m firstpostModel) viewDilemma() string {
 	)
 
 	prompt := textBody.Render("what's on your mind?")
+
+	exampleLabel := textMute.Render("examples ·")
+	exampleStyle := textDim.Italic(true)
+	examples := lipgloss.JoinVertical(lipgloss.Left,
+		exampleLabel,
+		exampleStyle.Render(`  "everyone's bagging placement offers and i'm spiraling"`),
+		exampleStyle.Render(`  "is the OS prof actually checking attendance or nah"`),
+	)
+
 	box := formBoxFocused.Render(m.input.View())
 	counter := lipgloss.NewStyle().
 		Width(ContentWidth).Align(lipgloss.Right).Foreground(colorTextMute).
@@ -284,6 +293,7 @@ func (m firstpostModel) viewDilemma() string {
 		header, tagline, rule, "",
 		intro, "",
 		prompt, "",
+		examples, "",
 		box, counter, "",
 		statusLine,
 		footer,
@@ -293,14 +303,15 @@ func (m firstpostModel) viewDilemma() string {
 
 func (m firstpostModel) viewLoading() string {
 	header := brandText.Render("drafting…")
-	tagline := textDim.Render("asking the model for two angles · 5-15 seconds")
+	tagline := textDim.Render("reasoning model · usually 30-60 seconds")
 
 	rule := lipgloss.NewStyle().Foreground(colorBorder).
 		Render(strings.Repeat("─", ContentWidth-4))
 
 	body := textBody.Render(
-		"sit tight. we're asking gemma-4 for two short anonymous variants\n" +
-			"of your line — different angles on the same situation.",
+		"sit tight. gemma-4 is thinking through two short anonymous\n" +
+			"variants of your line — different angles on the same situation.\n" +
+			"reasoning models trade speed for quality, so this is the slow part.",
 	)
 
 	hint := textMute.Render("ctrl+c to quit")

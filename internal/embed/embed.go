@@ -62,10 +62,15 @@ func FromEnv() *Client {
 	if aid == "" || tok == "" {
 		return nil
 	}
+	// 120s upper bound on the HTTP client. Embed callers pass a short
+	// per-call ctx (5-6s) so this is just a safety net for them, but
+	// Draft hits a reasoning chat model that routinely takes 30-60s
+	// to think + emit JSON — anything tighter and reasoning calls
+	// die before they finish.
 	return &Client{
 		accountID: aid,
 		token:     tok,
-		httpc:     &http.Client{Timeout: 10 * time.Second},
+		httpc:     &http.Client{Timeout: 120 * time.Second},
 	}
 }
 
