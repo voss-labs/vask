@@ -21,7 +21,9 @@ const (
 	maxTitleChars = 120
 	maxBodyChars  = 2000
 	maxTagsChars  = 100
-	maxTagsPerPost = 5
+	// Max tags per post — kept tight so the tag row never wraps in the
+	// terminal feed. Anything more turns the post header into noise.
+	maxTagsPerPost = 2
 
 	stepTitle = 0
 	stepBody  = 1

@@ -249,10 +249,13 @@ func (m firstpostModel) viewDilemma() string {
 		Render(strings.Repeat("─", ContentWidth-4))
 
 	intro := textBody.Render(
-		"give us one line — a dilemma, a hot take, a thing you wish someone\n" +
-			"would tell you. we'll draft an anonymous starter post you can send\n" +
-			"in one keystroke (or reroll until you like it). nothing about your\n" +
-			"line gets saved.",
+		"write whatever's been on your mind — internship hunt, ml vs ds\n" +
+			"confusion, skill-stack panic, that course you're already behind\n" +
+			"in, placement worries, group-project drama. or literally anything.\n" +
+			"\n" +
+			"we'll wrap it into one short anonymous post. people reply, you\n" +
+			"check back tomorrow. nobody knows it's you. your line itself is\n" +
+			"never saved.",
 	)
 
 	prompt := textBody.Render("what's on your mind?")

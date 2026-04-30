@@ -798,11 +798,19 @@ func (s *Store) DeleteOwnPost(ctx context.Context, userID, postID int64) error {
 	if err := row.Scan(&x); err != nil {
 		return err
 	}
+	// Cascade order: every table with a FK to posts(id) must be cleared
+	// (or NULLed) before the post row itself goes. Missed any of these
+	// and the final DELETE FROM posts trips a FOREIGN KEY constraint.
 	stmts := []string{
 		`DELETE FROM comment_votes WHERE comment_id IN (SELECT id FROM comments WHERE post_id = ?)`,
 		`DELETE FROM comments      WHERE post_id = ?`,
 		`DELETE FROM post_votes    WHERE post_id = ?`,
 		`DELETE FROM post_tags     WHERE post_id = ?`,
+		`DELETE FROM post_views    WHERE post_id = ?`,
+		// Preserve moderation audit rows but disconnect them from the
+		// vanishing post so the FK doesn't fire. target_post_id is
+		// nullable in 001_init.sql precisely for this case.
+		`UPDATE moderation_actions SET target_post_id = NULL WHERE target_post_id = ?`,
 	}
 	for _, q := range stmts {
 		if _, err := tx.ExecContext(ctx, q, postID); err != nil {

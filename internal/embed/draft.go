@@ -36,7 +36,7 @@ return only this exact json array, with ONE object:
 [
   {"title": "...", "body": "...", "tags": ["...", "..."]}
 ]
-2-4 lowercase or hyphenated tags. no other text outside the array.`
+1-2 lowercase or hyphenated tags MAX. terminal UI — tag rows can't wrap. no other text outside the array.`
 
 // Draft asks the LLM to turn a 1-line user dilemma into 2 ready-to-post
 // variants. Returns ErrNotConfigured if the client wasn't set up; any

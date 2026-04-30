@@ -44,7 +44,6 @@ type detailModel struct {
 	collapse         map[int64]bool // commentIDs whose subtree is hidden right now
 	autoFoldApplied  bool           // ensures we only auto-fold once per detail mount
 	bodyExpanded     bool           // user toggled space on cursor=0 to see full body
-	similar          []store.Post   // up to 3 semantically nearest posts; numbered 1/2/3 for jump
 	cursor           int
 	width            int
 	height           int
@@ -93,10 +92,6 @@ type detailReplyPostedMsg struct {
 	err error
 }
 
-type similarLoadedMsg struct {
-	posts []store.Post
-}
-
 type detailDeleteMsg struct {
 	isComment bool
 	targetID  int64
@@ -133,20 +128,7 @@ func (m detailModel) Init() tea.Cmd {
 	return tea.Batch(
 		loadDetail(m.st, m.postID, m.user.ID),
 		markSeen(m.st, m.user.ID, m.postID),
-		loadSimilar(m.st, m.postID),
 	)
-}
-
-// loadSimilar fetches up to 3 semantically nearest posts. Returns an
-// empty slice if the source post has no embedding (graceful no-op for
-// posts created before semantic search shipped).
-func loadSimilar(st *store.Store, postID int64) tea.Cmd {
-	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
-		defer cancel()
-		posts, _ := st.NearestPostsToPost(ctx, postID, 3)
-		return similarLoadedMsg{posts: posts}
-	}
 }
 
 // === commands ============================================================
@@ -299,9 +281,6 @@ func (m detailModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.post.MyVote = msg.newVote
 		}
 
-	case similarLoadedMsg:
-		m.similar = msg.posts
-
 	case detailReplyPostedMsg:
 		m.sending = false
 		if msg.err != nil {
@@ -389,17 +368,6 @@ func (m detailModel) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// cursor is on a comment.
 		if m.cursor == 0 {
 			m.bodyExpanded = !m.bodyExpanded
-		}
-		return m, nil
-	case "1", "2", "3":
-		// Quick-jump to the corresponding similar post. The "similar
-		// posts" rail renders 1-indexed, so digit `n` opens m.similar[n-1].
-		// No-op while the rail is empty (post had no embedding, or the
-		// nearest-posts query returned nothing).
-		idx := int(key[0] - '1')
-		if idx < len(m.similar) {
-			id := m.similar[idx].ID
-			return m, func() tea.Msg { return openDetailMsg{postID: id} }
 		}
 		return m, nil
 	case "c":
@@ -678,7 +646,6 @@ func renderDetailHeader(p *store.Post) string {
 
 func (m detailModel) renderPostAndComments() string {
 	post := m.renderPostBlock(m.cursor == 0, m.pendingDeleteCursor == 0)
-	similar := m.renderSimilarRail()
 	commentsHeader := lipgloss.NewStyle().
 		Foreground(colorTextDim).
 		MarginTop(1).
@@ -704,50 +671,8 @@ func (m detailModel) renderPostAndComments() string {
 		}
 	}
 
-	parts := []string{post}
-	if similar != "" {
-		parts = append(parts, similar)
-	}
-	parts = append(parts, commentsHeader, strings.Join(commentRows, "\n"))
-	return lipgloss.JoinVertical(lipgloss.Left, parts...)
-}
-
-// renderSimilarRail returns the "── similar posts ──" section that sits
-// between the post body and the comments header. Hidden (returns "")
-// when the source post has no embedding yet or the nearest-query found
-// nothing — common during the embedding rollout window when most posts
-// don't have vectors yet.
-//
-// Each entry is numbered 1/2/3 — those digits jump to the post directly,
-// since detail is a one-pane view and there's nowhere else for digits
-// to go. Tags are surfaced inline so the relation between posts is
-// readable at a glance.
-func (m detailModel) renderSimilarRail() string {
-	if len(m.similar) == 0 {
-		return ""
-	}
-	headStyle := lipgloss.NewStyle().
-		Foreground(colorTextDim).
-		Italic(true).
-		MarginTop(1).
-		MarginBottom(0)
-	header := headStyle.Render(fmt.Sprintf("─── similar posts (%d) ───", len(m.similar)))
-
-	var rows []string
-	for i, p := range m.similar {
-		key := keyChip.Render(fmt.Sprintf("[%d]", i+1))
-		title := lipgloss.NewStyle().Foreground(colorText).
-			Render(truncateRunes(p.Title, 50))
-		tagsInline := renderTagChipsInline(p.Tags)
-		row := "  " + key + "  " + title
-		if tagsInline != "" {
-			row += "   " + tagsInline
-		}
-		rows = append(rows, row)
-	}
 	return lipgloss.JoinVertical(lipgloss.Left,
-		header,
-		strings.Join(rows, "\n"),
+		post, commentsHeader, strings.Join(commentRows, "\n"),
 	)
 }
 
@@ -1052,7 +977,6 @@ func renderDetailHelp() string {
 			{"c", "collapse / expand subtree"},
 		}},
 		{"explore", [][2]string{
-			{"1 / 2 / 3", "jump to similar post (when shown)"},
 			{"space", "expand long body (cursor on post)"},
 		}},
 		{"vote & delete", [][2]string{
