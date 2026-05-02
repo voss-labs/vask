@@ -10,6 +10,14 @@ name: release
 #
 # Sequential pipeline; each stage is a separate job with needs:.
 # Failure at any stage stops the chain.
+#
+# Required repo secrets:
+#   ORACLE_SSH_HOST / ORACLE_SSH_PORT / ORACLE_SSH_USER / ORACLE_SSH_KEY
+#   TURSO_DATABASE_URL / TURSO_AUTH_TOKEN
+#   CF_ACCOUNT_ID / CF_AI_TOKEN              (optional — embeddings)
+#   VASK_BASE_URL                            (e.g. https://vask.vosslabs.org)
+#   VASK_OG_IMAGE                            (optional — social card image URL)
+#   CADDY_EMAIL                              (optional — Let's Encrypt notices)
 
 on:
   push:
@@ -50,7 +58,7 @@ jobs:
         run: |
           mkdir -p bin
           for arch in amd64 arm64; do
-            for cmd in vask vask-embed-backfill; do
+            for cmd in vask vask-embed-backfill vask-web; do
               GOOS=linux GOARCH=$arch \
                 go build -trimpath -ldflags="-s -w" \
                   -o "bin/${cmd}.linux-${arch}" "./cmd/${cmd}"
@@ -81,15 +89,24 @@ jobs:
           # container can't list it and drone-scp produces an empty tar
           # ("tar: empty archive"). The runner workspace is ephemeral
           # anyway — secret protection happens on the remote VM, where
-          # turso.env is written with `install -m 0600 -o vask -g vask`.
+          # turso.env / vask-web.env are written with `install -m 0600`.
           mkdir -p staged
-          cp bin/vask.linux-amd64 staged/vask.linux-amd64
-          cp deploy/vask.service  staged/vask.service
+          # SSH server tier
+          cp bin/vask.linux-amd64       staged/vask.linux-amd64
+          cp deploy/vask.service        staged/vask.service
           cat > staged/turso.env <<EOF
           TURSO_DATABASE_URL=${{ secrets.TURSO_DATABASE_URL }}
           TURSO_AUTH_TOKEN=${{ secrets.TURSO_AUTH_TOKEN }}
           CF_ACCOUNT_ID=${{ secrets.CF_ACCOUNT_ID }}
           CF_AI_TOKEN=${{ secrets.CF_AI_TOKEN }}
+          EOF
+          # Web tier
+          cp bin/vask-web.linux-amd64   staged/vask-web.linux-amd64
+          cp deploy/vask-web.service    staged/vask-web.service
+          cp deploy/Caddyfile           staged/Caddyfile
+          cat > staged/vask-web.env <<EOF
+          VASK_BASE_URL=${{ secrets.VASK_BASE_URL }}
+          VASK_OG_IMAGE=${{ secrets.VASK_OG_IMAGE }}
           EOF
           chmod 755 staged
           chmod 644 staged/*
@@ -103,37 +120,93 @@ jobs:
           key: ${{ secrets.ORACLE_SSH_KEY }}
           # comma-separated explicit paths (the action does NOT shell-glob;
           # passing "staged/*" silently produces an empty tar)
-          source: "staged/vask.linux-amd64,staged/vask.service,staged/turso.env"
+          source: "staged/vask.linux-amd64,staged/vask.service,staged/turso.env,staged/vask-web.linux-amd64,staged/vask-web.service,staged/Caddyfile,staged/vask-web.env"
           target: "/tmp/"
           strip_components: 1
-      - name: install + restart
+      - name: install + restart (ssh tier + web tier + caddy)
         uses: appleboy/ssh-action@v1.2.5
+        env:
+          CADDY_EMAIL: ${{ secrets.CADDY_EMAIL }}
         with:
           host: ${{ secrets.ORACLE_SSH_HOST }}
           port: ${{ secrets.ORACLE_SSH_PORT }}
           username: ${{ secrets.ORACLE_SSH_USER }}
           key: ${{ secrets.ORACLE_SSH_KEY }}
+          envs: CADDY_EMAIL
           script: |
             set -euo pipefail
+
+            # ---------- SSH tier (vask) ---------------------------------
             sudo install -o vask -g vask -m 0755 /tmp/vask.linux-amd64 /opt/vask/vask
             sudo install -o vask -g vask -m 0600 /tmp/turso.env       /opt/vask/data/turso.env
             sudo mv /tmp/vask.service /etc/systemd/system/
+
+            # ---------- Web tier (vask-web) -----------------------------
+            sudo install -o vask -g vask -m 0755 /tmp/vask-web.linux-amd64 /opt/vask/vask-web
+            sudo install -o vask -g vask -m 0600 /tmp/vask-web.env         /opt/vask/data/vask-web.env
+            sudo mv /tmp/vask-web.service /etc/systemd/system/
+
+            # ---------- Caddy bootstrap (idempotent) --------------------
+            if ! command -v caddy >/dev/null; then
+              sudo apt-get update -qq
+              sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+                debian-keyring debian-archive-keyring apt-transport-https curl >/dev/null
+              curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
+                | sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+              curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
+                | sudo tee /etc/apt/sources.list.d/caddy-stable.list >/dev/null
+              sudo apt-get update -qq
+              sudo DEBIAN_FRONTEND=noninteractive apt-get install -y caddy >/dev/null
+              echo "caddy installed"
+            fi
+            sudo mkdir -p /var/log/caddy
+            sudo chown caddy:caddy /var/log/caddy
+
+            # ---------- Caddyfile ---------------------------------------
+            if [ -n "${CADDY_EMAIL:-}" ]; then
+              sudo sed -i "s|{\$CADDY_EMAIL:[^}]*}|$CADDY_EMAIL|g" /tmp/Caddyfile
+            fi
+            sudo install -o root -g root -m 0644 /tmp/Caddyfile /etc/caddy/Caddyfile
+            rm -f /tmp/Caddyfile
+
+            # ---------- Open ports 80/443 (idempotent) ------------------
+            for port in 80 443; do
+              if ! sudo iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null; then
+                sudo iptables -I INPUT -p tcp --dport "$port" -j ACCEPT
+                if   command -v netfilter-persistent >/dev/null; then
+                  sudo netfilter-persistent save >/dev/null 2>&1 || true
+                elif [ -d /etc/iptables ]; then
+                  sudo iptables-save | sudo tee /etc/iptables/rules.v4 >/dev/null
+                fi
+              fi
+            done
+
+            # ---------- Reload everything -------------------------------
             sudo systemctl daemon-reload
+            sudo systemctl enable vask vask-web caddy >/dev/null 2>&1 || true
             sudo systemctl restart vask
+            sudo systemctl restart vask-web
+            sudo systemctl reload caddy 2>/dev/null || sudo systemctl restart caddy
             sleep 2
-            sudo systemctl status vask --no-pager -l --lines=10
+
+            echo "---- vask ----"
+            sudo systemctl status vask     --no-pager -l --lines=6 || true
+            echo "---- vask-web ----"
+            sudo systemctl status vask-web --no-pager -l --lines=6 || true
+            echo "---- caddy ----"
+            sudo systemctl status caddy    --no-pager -l --lines=6 || true
 
   smoke:
     needs: deploy
     runs-on: ubuntu-latest
     permissions: {}
     steps:
-      - name: probe IP + domain
+      - name: ssh banner probe (port 22)
         run: |
           set -e
           sleep 3
 
-          probe() {
+          probe_ssh() {
             local label="$1" host="$2"
             if ! nc -z -w 10 "$host" 22; then
               echo "::error::tcp/22 unreachable at $label ($host)"
@@ -142,16 +215,42 @@ jobs:
             local banner
             banner=$(echo "" | nc -w 5 "$host" 22 2>&1 | head -1 | tr -d '\r')
             if echo "$banner" | grep -q "SSH-2"; then
-              echo "::notice::$label OK — banner: $banner"
+              echo "::notice::$label SSH OK — banner: $banner"
               return 0
             fi
             echo "::error::$label answered tcp/22 but no SSH-2 banner: $banner"
             return 1
           }
 
-          probe "IP"     "${{ secrets.ORACLE_SSH_HOST }}"
-          probe "domain" "vask.vosslabs.org" || \
+          probe_ssh "IP"     "${{ secrets.ORACLE_SSH_HOST }}"
+          probe_ssh "domain" "vask.vosslabs.org" || \
             echo "::warning::domain probe failed — likely DNS not yet propagated"
+
+      - name: https probe (vask-web)
+        run: |
+          set +e
+          # First deploy may take 30-60s for Caddy to issue the Let's Encrypt
+          # cert via HTTP-01. Retry with backoff and downgrade hard fails to
+          # warnings — the SSH probe above is the gating signal.
+          for i in 1 2 3 4 5 6; do
+            code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 15 \
+              https://vask.vosslabs.org/healthz || echo "000")
+            if [ "$code" = "200" ]; then
+              echo "::notice::vask-web /healthz returned 200 (attempt $i)"
+              break
+            fi
+            echo "attempt $i: status=$code — retrying in 10s"
+            sleep 10
+          done
+
+          if [ "$code" != "200" ]; then
+            echo "::warning::vask-web /healthz did not return 200 — TLS may still be provisioning, or check journalctl -u vask-web / journalctl -u caddy"
+            exit 0
+          fi
+
+          echo "::notice::headers from vask.vosslabs.org:"
+          curl -sI --max-time 15 https://vask.vosslabs.org/ \
+            | grep -iE 'content-security-policy|strict-transport-security|x-frame-options|x-content-type-options' || true
 
   release:
     needs: smoke

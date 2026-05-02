@@ -1,0 +1,46 @@
+# Caddy config for vask.vosslabs.org — TLS edge in front of vask-web.
+#
+# DNS for vask.vosslabs.org MUST be gray-cloud (DNS-only) on Cloudflare.
+# Orange-cloud would route SSH (port 22) through CF, which doesn't carry
+# SSH on the free plan and breaks `ssh vask.vosslabs.org` for users.
+#
+# This file is installed at /etc/caddy/Caddyfile by setup-vask-web.sh.
+# Caddy auto-issues a Let's Encrypt cert on first reload.
+
+{
+	# Email goes to Let's Encrypt for cert expiry warnings. Override
+	# at deploy time via the CADDY_EMAIL env var in setup-vask-web.sh.
+	email {$CADDY_EMAIL:vask@vosslabs.org}
+	admin off
+}
+
+vask.vosslabs.org {
+	encode gzip zstd
+
+	reverse_proxy 127.0.0.1:8080 {
+		header_up X-Real-IP {remote_host}
+		header_up X-Forwarded-For {remote_host}
+	}
+
+	header {
+		# HSTS lives at the TLS edge — Go can't safely set this on dev
+		# (it would be ignored over plain HTTP and look broken in tools).
+		Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+
+		# vask-web's secureHeaders middleware sets CSP, X-Frame-Options,
+		# X-Content-Type-Options, Referrer-Policy, Permissions-Policy.
+		# Caddy preserves those by default, no need to duplicate.
+
+		# Strip Caddy's identifying header.
+		-Server
+	}
+
+	log {
+		output file /var/log/caddy/vask-web.log {
+			roll_size 10mb
+			roll_keep 5
+			roll_keep_for 720h
+		}
+		format console
+	}
+}

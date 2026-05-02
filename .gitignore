@@ -36,3 +36,4 @@ go.work.sum
 
 # operator-only one-shot scripts (kept locally, never committed)
 deploy/reset-vm.sh
+deploy/seed.json

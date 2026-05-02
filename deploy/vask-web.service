@@ -1,0 +1,54 @@
+[Unit]
+Description=vask web mirror — read-only HTTP front for the SSH forum
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vask
+Group=vask
+WorkingDirectory=/opt/vask
+
+# Shares Turso creds with vask.service. vask-web.env carries the web-only
+# config (VASK_BASE_URL, VASK_OG_IMAGE). systemd treats a missing file
+# (the leading "-") as a non-error so the service still starts during a
+# fresh deploy before vask-web.env is written.
+EnvironmentFile=/opt/vask/data/turso.env
+EnvironmentFile=-/opt/vask/data/vask-web.env
+
+# Bound to localhost — Caddy is the public-facing TLS terminator on :443.
+ExecStart=/opt/vask/vask-web --addr 127.0.0.1:8080
+
+Restart=on-failure
+RestartSec=5
+
+# Hardening — pure-Go binary, no CGO, no JIT. Each directive verified
+# safe against the libsql HTTP client and modernc.org/sqlite (pure Go).
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+# vask-web is read-only — no disk writes under normal operation.
+# PrivateTmp gives the libsql client a writable scratch /tmp.
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

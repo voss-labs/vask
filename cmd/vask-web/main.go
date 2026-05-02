@@ -25,7 +25,6 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
@@ -39,6 +38,18 @@ func main() {
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
+
+	// VASK_BASE_URL is the canonical public origin (e.g. https://vask.vosslabs.org).
+	// Drives canonical/og:url tags, sitemap loc entries, and robots Sitemap line.
+	baseURL := strings.TrimRight(os.Getenv("VASK_BASE_URL"), "/")
+	if baseURL == "" {
+		baseURL = "http://" + *addr
+		logger.Warn("VASK_BASE_URL unset — falling back to http dev URL; DO NOT ship to production like this", "fallback", baseURL)
+	}
+	// VASK_OG_IMAGE is an absolute URL to a 1200×630 PNG/JPG used for social
+	// previews. Twitter/Slack/Discord won't render SVG so leave empty until you
+	// have a raster file hosted (e.g. https://vosslabs.org/brand/social/og-default.png).
+	ogImage := strings.TrimSpace(os.Getenv("VASK_OG_IMAGE"))
 
 	target := os.Getenv("TURSO_DATABASE_URL")
 	token := os.Getenv("TURSO_AUTH_TOKEN")
@@ -65,19 +76,20 @@ func main() {
 	}
 	warmCancel()
 
-	srv := newServer(st, logger)
+	srv := newServer(st, logger, baseURL, ogImage)
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", srv.handleFeed(store.SortHot, "hot"))
 	mux.HandleFunc("GET /new", srv.handleFeed(store.SortNew, "new"))
 	mux.HandleFunc("GET /top", srv.handleFeed(store.SortTop, "top"))
 	mux.HandleFunc("GET /tag/{tag}", srv.handleTag)
 	mux.HandleFunc("GET /p/{id}", srv.handlePost)
+	mux.HandleFunc("GET /sitemap.xml", srv.handleSitemap)
 	mux.HandleFunc("GET /healthz", srv.handleHealth)
 	mux.HandleFunc("GET /robots.txt", srv.handleRobots)
 
 	httpSrv := &http.Server{
 		Addr:              *addr,
-		Handler:           mux,
+		Handler:           secureHeaders(mux),
 		ReadHeaderTimeout: 5 * time.Second,
 		WriteTimeout:      15 * time.Second,
 		IdleTimeout:       60 * time.Second,
@@ -127,14 +139,21 @@ type server struct {
 	feedTpl *template.Template
 	postTpl *template.Template
 	cache   *lru
+	baseURL string
+	ogImage string
 }
 
-func newServer(st *store.Store, log *slog.Logger) *server {
+func newServer(st *store.Store, log *slog.Logger, baseURL, ogImage string) *server {
 	feedT := template.Must(template.New("base").Funcs(funcs).Parse(baseTpl))
 	feedT = template.Must(feedT.Parse(feedTpl))
 	postT := template.Must(template.New("base").Funcs(funcs).Parse(baseTpl))
 	postT = template.Must(postT.Parse(postTpl))
-	return &server{store: st, log: log, feedTpl: feedT, postTpl: postT, cache: newLRU(500)}
+	return &server{
+		store: st, log: log,
+		feedTpl: feedT, postTpl: postT,
+		cache:   newLRU(500),
+		baseURL: baseURL, ogImage: ogImage,
+	}
 }
 
 // handlers ============================================================
@@ -158,7 +177,9 @@ func (s *server) handleFeed(sort store.SortMode, label string) http.HandlerFunc 
 		}
 		w.Header().Set("Cache-Control", "public, max-age=30, s-maxage=60, stale-while-revalidate=600")
 		s.render(w, key, s.feedTpl, feedView{
-			Title: label, Sort: label, Posts: posts, Offset: offset,
+			pageMeta: s.feedMeta(label, ""),
+			Posts:    posts,
+			Offset:   offset,
 		}, 30*time.Second)
 	}
 }
@@ -186,7 +207,10 @@ func (s *server) handleTag(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Cache-Control", "public, max-age=60, s-maxage=120, stale-while-revalidate=600")
 	s.render(w, key, s.feedTpl, feedView{
-		Title: "#" + tag, Sort: "tag", Tag: tag, Posts: posts, Offset: offset,
+		pageMeta: s.feedMeta("tag", tag),
+		Tag:      tag,
+		Posts:    posts,
+		Offset:   offset,
 	}, 60*time.Second)
 }
 
@@ -216,7 +240,9 @@ func (s *server) handlePost(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Cache-Control", "public, max-age=60, s-maxage=120, stale-while-revalidate=600")
 	s.render(w, key, s.postTpl, postView{
-		Title: post.Title, Post: *post, Threads: threadComments(comments),
+		pageMeta: s.postMeta(*post),
+		Post:     *post,
+		Threads:  threadComments(comments),
 	}, 60*time.Second)
 }
 
@@ -233,7 +259,64 @@ func (s *server) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) handleRobots(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "public, max-age=86400")
-	fmt.Fprint(w, "User-agent: *\nAllow: /\n")
+	fmt.Fprintf(w, "User-agent: *\nAllow: /\nDisallow: /healthz\nSitemap: %s/sitemap.xml\n", s.baseURL)
+}
+
+func (s *server) handleSitemap(w http.ResponseWriter, r *http.Request) {
+	const key = "sitemap"
+	if body, ok := s.cache.get(key); ok {
+		w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+		w.Header().Set("Cache-Control", "public, max-age=300")
+		_, _ = w.Write(body)
+		return
+	}
+	posts, err := s.store.ListPosts(r.Context(), 0, store.ListPostsParams{
+		Sort: store.SortNew, Limit: 500,
+	})
+	if err != nil {
+		s.fail(w, "sitemap list posts", err)
+		return
+	}
+	var b strings.Builder
+	b.WriteString(`<?xml version="1.0" encoding="UTF-8"?>` + "\n")
+	b.WriteString(`<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">` + "\n")
+	for _, p := range []string{"/", "/new", "/top"} {
+		fmt.Fprintf(&b, "  <url><loc>%s%s</loc><changefreq>hourly</changefreq><priority>0.8</priority></url>\n", s.baseURL, p)
+	}
+	for _, p := range posts {
+		fmt.Fprintf(&b,
+			"  <url><loc>%s/p/%d</loc><lastmod>%s</lastmod></url>\n",
+			s.baseURL, p.ID, p.CreatedAt.UTC().Format("2006-01-02"))
+	}
+	b.WriteString(`</urlset>` + "\n")
+	body := []byte(b.String())
+	s.cache.set(key, body, 5*time.Minute)
+	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+	w.Header().Set("Cache-Control", "public, max-age=300")
+	_, _ = w.Write(body)
+}
+
+// secureHeaders sets baseline security response headers on every reply.
+// HSTS is intentionally NOT set here — the TLS edge (Caddy) is the right
+// place for it, and setting HSTS over plain HTTP in dev would error.
+func secureHeaders(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hdr := w.Header()
+		hdr.Set("X-Content-Type-Options", "nosniff")
+		hdr.Set("Referrer-Policy", "no-referrer")
+		hdr.Set("Permissions-Policy", "interest-cohort=(), browsing-topics=()")
+		hdr.Set("X-Frame-Options", "DENY")
+		hdr.Set("Content-Security-Policy",
+			"default-src 'self'; "+
+				"script-src 'none'; "+
+				"style-src 'self' 'unsafe-inline'; "+
+				"img-src 'self' data: https:; "+
+				"font-src 'self' data:; "+
+				"form-action 'none'; "+
+				"frame-ancestors 'none'; "+
+				"base-uri 'self'")
+		h.ServeHTTP(w, r)
+	})
 }
 
 // rendering + LRU =====================================================
@@ -268,16 +351,28 @@ func (s *server) fail(w http.ResponseWriter, what string, err error) {
 
 // view models =========================================================
 
+// pageMeta is shared <head>/canonical/social-preview metadata embedded in
+// every concrete view. Lives at the top level of the template data so the
+// base layout can reach it directly via {{.Title}}, {{.Description}}, etc.
+type pageMeta struct {
+	Title       string // human-readable page title (Hot, post title, #tag)
+	Sort        string // hot | new | top | tag | post — drives nav active state
+	Description string // <meta description> + og:description + twitter:description
+	Path        string // canonical URL path (e.g. /p/123) — no query string
+	BaseURL     string // canonical origin (e.g. https://vask.vosslabs.org)
+	OGType      string // website | article
+	OGImage     string // absolute URL to a 1200×630 PNG/JPG; empty omits the tag
+}
+
 type feedView struct {
-	Title  string
-	Sort   string
+	pageMeta
 	Tag    string
 	Posts  []store.Post
 	Offset int
 }
 
 type postView struct {
-	Title   string
+	pageMeta
 	Post    store.Post
 	Threads []*commentNode
 }
@@ -285,6 +380,59 @@ type postView struct {
 type commentNode struct {
 	C        store.Comment
 	Children []*commentNode
+}
+
+// meta builders =======================================================
+
+func (s *server) feedMeta(label, tag string) pageMeta {
+	var title, desc, path string
+	switch label {
+	case "tag":
+		title = "#" + tag
+		desc = fmt.Sprintf("Posts tagged #%s on vask — read-only web mirror of the Vidyalankar Open Source Software Labs SSH forum.", tag)
+		path = "/tag/" + tag
+	case "new":
+		title = "New"
+		desc = "Latest discussions on vask — read-only web mirror of the Vidyalankar Open Source Software Labs SSH forum. Reply via ssh vask.vosslabs.org."
+		path = "/new"
+	case "top":
+		title = "Top"
+		desc = "Top-voted discussions on vask — read-only web mirror of the Vidyalankar Open Source Software Labs SSH forum. Reply via ssh vask.vosslabs.org."
+		path = "/top"
+	default: // "hot"
+		title = "Hot"
+		desc = "Trending discussions on vask — read-only web mirror of the Vidyalankar Open Source Software Labs SSH forum. Reply via ssh vask.vosslabs.org."
+		path = "/"
+	}
+	return pageMeta{
+		Title: title, Sort: label, Description: desc, Path: path,
+		BaseURL: s.baseURL, OGType: "website", OGImage: s.ogImage,
+	}
+}
+
+func (s *server) postMeta(p store.Post) pageMeta {
+	return pageMeta{
+		Title:       p.Title,
+		Sort:        "post",
+		Description: postDescription(p),
+		Path:        fmt.Sprintf("/p/%d", p.ID),
+		BaseURL:     s.baseURL,
+		OGType:      "article",
+		OGImage:     s.ogImage,
+	}
+}
+
+func postDescription(p store.Post) string {
+	body := strings.TrimSpace(p.Body)
+	if body == "" {
+		return p.Title
+	}
+	body = strings.Join(strings.Fields(body), " ") // collapse all whitespace runs
+	rs := []rune(body)
+	if len(rs) > 200 {
+		return string(rs[:200]) + "…"
+	}
+	return body
 }
 
 func threadComments(cs []store.Comment) []*commentNode {
@@ -306,52 +454,6 @@ func threadComments(cs []store.Comment) []*commentNode {
 	return roots
 }
 
-// LRU =================================================================
-
-type lruEntry struct {
-	body []byte
-	exp  time.Time
-}
-
-type lru struct {
-	mu  sync.Mutex
-	m   map[string]lruEntry
-	max int
-}
-
-func newLRU(max int) *lru { return &lru{m: make(map[string]lruEntry, max), max: max} }
-
-func (l *lru) get(key string) ([]byte, bool) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	e, ok := l.m[key]
-	if !ok || time.Now().After(e.exp) {
-		delete(l.m, key)
-		return nil, false
-	}
-	return e.body, true
-}
-
-func (l *lru) set(key string, body []byte, ttl time.Duration) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if len(l.m) >= l.max {
-		now := time.Now()
-		for k, e := range l.m {
-			if now.After(e.exp) {
-				delete(l.m, k)
-			}
-		}
-		for len(l.m) >= l.max {
-			for k := range l.m {
-				delete(l.m, k)
-				break
-			}
-		}
-	}
-	l.m[key] = lruEntry{body: body, exp: time.Now().Add(ttl)}
-}
-
 // helpers =============================================================
 
 func redactURL(u string) string {
@@ -360,146 +462,3 @@ func redactURL(u string) string {
 	}
 	return u
 }
-
-var funcs = template.FuncMap{
-	"ago": func(t time.Time) string {
-		d := time.Since(t)
-		switch {
-		case d < time.Minute:
-			return "just now"
-		case d < time.Hour:
-			return fmt.Sprintf("%dm ago", int(d.Minutes()))
-		case d < 24*time.Hour:
-			return fmt.Sprintf("%dh ago", int(d.Hours()))
-		default:
-			return fmt.Sprintf("%dd ago", int(d.Hours()/24))
-		}
-	},
-	"snippet": func(s string) string {
-		s = strings.TrimSpace(s)
-		r := []rune(s)
-		if len(r) <= 220 {
-			return s
-		}
-		return string(r[:220]) + "…"
-	},
-	"author": func(name string, id int64) string {
-		if name == "" {
-			return fmt.Sprintf("anony-%d", id)
-		}
-		return name
-	},
-	"add": func(a, b int) int { return a + b },
-}
-
-// templates ===========================================================
-//
-// Inline stylesheet: zero static asset requests, monospace-leaning to
-// echo the SSH UI. html/template auto-escapes all interpolated user
-// content.
-
-const baseTpl = `<!doctype html>
-<html lang="en"><head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{{.Title}} — vask</title>
-<style>
-  /* palette mirrors internal/tui/style.go — same tokens as vosslabs.org */
-  :root {
-    --bg:        #0a0a0a;
-    --fg:        #FAFAFA;
-    --dim:       #A8A29E;
-    --mute:      #737373;
-    --border:    #3A3A3A;
-    --border-hi: #525252;
-    --brand:     #FB7A3C;
-    --brand-deep:#C4421D;
-    color-scheme: dark;
-  }
-  html, body { background: var(--bg); color: var(--fg); }
-  body { font: 15px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace;
-         max-width: 760px; margin: 0 auto; padding: 1.5rem 1rem 3rem; }
-  a { color: var(--brand); text-underline-offset: 3px; }
-  a:hover { color: var(--brand-deep); }
-  header, footer { display: flex; gap: 1rem; align-items: baseline; flex-wrap: wrap; }
-  header { border-bottom: 1px solid var(--border); padding-bottom: .8rem; margin-bottom: 1rem; }
-  footer { border-top: 1px solid var(--border); padding-top: .8rem; margin-top: 2.5rem; color: var(--mute); }
-  header strong a { color: var(--brand); }
-  h1, h2 { font-size: 1.05rem; color: var(--brand); margin: 1.2rem 0 .5rem; }
-  ul.feed { list-style: none; padding: 0; margin: 0; }
-  ul.feed li { padding: .9rem 0; border-bottom: 1px dashed var(--border); }
-  ul.feed li > a { text-decoration: none; }
-  ul.feed li > a strong { color: var(--fg); }
-  ul.feed li > a:hover strong { color: var(--brand); }
-  .meta { font-size: .85em; color: var(--dim); margin: .25rem 0 .35rem; }
-  .body { white-space: pre-wrap; word-wrap: break-word; color: var(--fg); }
-  .tags a { margin-right: .4em; }
-  .comments { margin-top: 1.8rem; }
-  .comment { border-left: 2px solid var(--border-hi); padding: .35rem .8rem; margin: .55rem 0; }
-  .comment .children { margin-left: .8rem; }
-  .pager { margin-top: 1.5rem; display: flex; gap: 1.5rem; }
-  .hint { margin-left: auto; color: var(--mute); font-size: .85em; }
-  ::selection { background: var(--brand); color: var(--bg); }
-</style>
-</head><body>
-<header>
-  <strong><a href="/">vask</a></strong>
-  <a href="/">hot</a> <a href="/new">new</a> <a href="/top">top</a>
-  <span class="hint">read-only mirror — ssh vask.vosslabs.org for the real thing</span>
-</header>
-{{block "main" .}}{{end}}
-<footer style="margin-top:3rem">
-  <span>vask.vosslabs.org</span>
-  <a href="https://github.com/voss-labs/vask">source</a>
-</footer>
-</body></html>`
-
-const feedTpl = `{{define "main"}}
-<h1>{{if eq .Sort "tag"}}#{{.Tag}}{{else}}{{.Sort}}{{end}}</h1>
-<ul class="feed">
-{{range .Posts}}
-  <li>
-    <a href="/p/{{.ID}}"><strong>{{.Title}}</strong></a>
-    <div class="meta">
-      {{author .Username .UserID}} · {{ago .CreatedAt}} ·
-      {{.Score}} pts · {{.CommentCount}} comments
-      {{if .Tags}}· <span class="tags">{{range .Tags}}<a href="/tag/{{.}}">#{{.}}</a> {{end}}</span>{{end}}
-    </div>
-    <div class="body">{{snippet .Body}}</div>
-  </li>
-{{else}}
-  <li>nothing here yet.</li>
-{{end}}
-</ul>
-{{if .Posts}}
-<div class="pager">
-  {{if gt .Offset 0}}<a href="?offset={{add .Offset -20}}">← prev</a>{{end}}
-  {{if eq (len .Posts) 20}}<a href="?offset={{add .Offset 20}}">next →</a>{{end}}
-</div>
-{{end}}
-{{end}}`
-
-const postTpl = `{{define "main"}}
-<article class="post">
-  <h1>{{.Post.Title}}</h1>
-  <div class="meta">
-    {{author .Post.Username .Post.UserID}} · {{ago .Post.CreatedAt}} ·
-    {{.Post.Score}} pts · {{.Post.CommentCount}} comments
-    {{if .Post.Tags}}· <span class="tags">{{range .Post.Tags}}<a href="/tag/{{.}}">#{{.}}</a> {{end}}</span>{{end}}
-  </div>
-  <div class="body">{{.Post.Body}}</div>
-</article>
-<section class="comments">
-  <h2>{{.Post.CommentCount}} comments</h2>
-  {{template "thread" .Threads}}
-</section>
-{{end}}
-{{define "thread"}}
-{{range .}}
-  <div class="comment">
-    <div class="meta">{{author .C.Username .C.UserID}} · {{ago .C.CreatedAt}} · {{.C.Score}} pts</div>
-    <div class="body">{{.C.Body}}</div>
-    {{if .Children}}<div class="children">{{template "thread" .Children}}</div>{{end}}
-  </div>
-{{end}}
-{{end}}`
