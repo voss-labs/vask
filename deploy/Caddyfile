@@ -17,9 +17,10 @@
 vask.vosslabs.org {
 	encode gzip zstd
 
+	# Caddy passes X-Forwarded-For automatically. Only X-Real-IP needs
+	# an explicit hop since vask-web's request logger may want it later.
 	reverse_proxy 127.0.0.1:8080 {
 		header_up X-Real-IP {remote_host}
-		header_up X-Forwarded-For {remote_host}
 	}
 
 	header {

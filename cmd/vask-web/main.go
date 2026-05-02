@@ -312,6 +312,8 @@ func secureHeaders(h http.Handler) http.Handler {
 				"style-src 'self' 'unsafe-inline'; "+
 				"img-src 'self' data: https:; "+
 				"font-src 'self' data:; "+
+				"manifest-src 'self' https://vosslabs.org; "+
+				"connect-src 'self'; "+
 				"form-action 'none'; "+
 				"frame-ancestors 'none'; "+
 				"base-uri 'self'")
