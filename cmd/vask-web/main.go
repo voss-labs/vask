@@ -84,6 +84,7 @@ func main() {
 	mux.HandleFunc("GET /tag/{tag}", srv.handleTag)
 	mux.HandleFunc("GET /p/{id}", srv.handlePost)
 	mux.HandleFunc("GET /sitemap.xml", srv.handleSitemap)
+	mux.HandleFunc("GET /site.webmanifest", srv.handleManifest)
 	mux.HandleFunc("GET /healthz", srv.handleHealth)
 	mux.HandleFunc("GET /robots.txt", srv.handleRobots)
 
@@ -262,6 +263,32 @@ func (s *server) handleRobots(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "User-agent: *\nAllow: /\nDisallow: /healthz\nSitemap: %s/sitemap.xml\n", s.baseURL)
 }
 
+// handleManifest serves the PWA manifest same-origin so the browser doesn't
+// require CORS on it (cross-origin manifests need Access-Control-Allow-Origin
+// from the host, which CF Pages doesn't send by default for /brand/*). Icon
+// URLs are absolute so the OS pulls them straight from vosslabs.org — manifest
+// icons themselves don't need CORS, only the manifest document does.
+func (s *server) handleManifest(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/manifest+json; charset=utf-8")
+	w.Header().Set("Cache-Control", "public, max-age=86400")
+	fmt.Fprint(w, `{
+  "name": "vask — Vidyalankar Open Source Software Labs",
+  "short_name": "vask",
+  "description": "Read-only web mirror of the SSH discussion forum at vosslabs.org",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "theme_color": "#0A0A0A",
+  "background_color": "#0A0A0A",
+  "icons": [
+    { "src": "https://vosslabs.org/brand/favicon/favicon.svg",       "sizes": "any",     "type": "image/svg+xml" },
+    { "src": "https://vosslabs.org/brand/favicon/icon-192.png",      "sizes": "192x192", "type": "image/png" },
+    { "src": "https://vosslabs.org/brand/favicon/icon-512.png",      "sizes": "512x512", "type": "image/png" },
+    { "src": "https://vosslabs.org/brand/favicon/apple-touch-icon.png", "sizes": "180x180", "type": "image/png", "purpose": "any" }
+  ]
+}`)
+}
+
 func (s *server) handleSitemap(w http.ResponseWriter, r *http.Request) {
 	const key = "sitemap"
 	if body, ok := s.cache.get(key); ok {
@@ -312,7 +339,7 @@ func secureHeaders(h http.Handler) http.Handler {
 				"style-src 'self' 'unsafe-inline'; "+
 				"img-src 'self' data: https:; "+
 				"font-src 'self' data:; "+
-				"manifest-src 'self' https://vosslabs.org; "+
+				"manifest-src 'self'; "+
 				"connect-src 'self'; "+
 				"form-action 'none'; "+
 				"frame-ancestors 'none'; "+

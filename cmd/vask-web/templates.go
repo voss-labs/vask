@@ -60,7 +60,7 @@ const baseTpl = `<!doctype html>
 <link rel="icon" href="https://vosslabs.org/brand/favicon/favicon.svg" type="image/svg+xml">
 <link rel="icon" href="https://vosslabs.org/brand/favicon/favicon-32.png" type="image/png" sizes="32x32">
 <link rel="apple-touch-icon" href="https://vosslabs.org/brand/favicon/apple-touch-icon.png" sizes="180x180">
-<link rel="manifest" href="https://vosslabs.org/brand/favicon/site.webmanifest">
+<link rel="manifest" href="/site.webmanifest">
 
 <meta property="og:type" content="{{.OGType}}">
 <meta property="og:title" content="{{.Title}}">
