@@ -2,7 +2,6 @@ package tui
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -306,12 +305,8 @@ func (m feedModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		)
 
 	case voteAppliedMsg:
-		if errors.Is(msg.err, store.ErrSelfVote) {
-			m.flash = "you can't vote on your own post."
-			return m, nil
-		}
 		if msg.err != nil {
-			m.flash = "couldn't vote: " + msg.err.Error()
+			m.flash = friendlyError(msg.err)
 			return m, nil
 		}
 		for i := range m.posts {
@@ -324,7 +319,7 @@ func (m feedModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case postDeletedMsg:
 		if msg.err != nil {
-			m.flash = "couldn't delete: " + msg.err.Error()
+			m.flash = friendlyError(msg.err)
 			m.pendingDeleteIdx = -1
 			return m, nil
 		}
@@ -334,7 +329,7 @@ func (m feedModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case accountDeletedMsg:
 		if msg.err != nil {
-			m.flash = "couldn't delete account: " + msg.err.Error()
+			m.flash = friendlyError(msg.err)
 			return m, nil
 		}
 		// success: terminate the SSH session. The user is now tombstoned;

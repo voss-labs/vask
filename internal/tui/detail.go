@@ -2,7 +2,6 @@ package tui
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -245,16 +244,8 @@ func (m detailModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case detailVoteMsg:
-		if errors.Is(msg.err, store.ErrSelfVote) {
-			label := "post"
-			if msg.isComment {
-				label = "comment"
-			}
-			m.flash = "you can't vote on your own " + label + "."
-			return m, nil
-		}
 		if msg.err != nil {
-			m.flash = "couldn't vote: " + msg.err.Error()
+			m.flash = friendlyError(msg.err)
 			return m, nil
 		}
 		if msg.isComment {
@@ -284,7 +275,7 @@ func (m detailModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case detailReplyPostedMsg:
 		m.sending = false
 		if msg.err != nil {
-			m.flash = "couldn't reply: " + msg.err.Error()
+			m.flash = friendlyError(msg.err)
 			return m, nil
 		}
 		m.replying = false
@@ -296,7 +287,7 @@ func (m detailModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case detailDeleteMsg:
 		m.pendingDeleteCursor = -1
 		if msg.err != nil {
-			m.flash = "couldn't delete: " + msg.err.Error()
+			m.flash = friendlyError(msg.err)
 			return m, nil
 		}
 		if !msg.isComment {

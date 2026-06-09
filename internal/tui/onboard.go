@@ -76,7 +76,7 @@ func (m onboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case usernameClaimResultMsg:
 		m.claiming = 0
 		if msg.err != nil {
-			m.flash = "couldn't reach the database — try again"
+			m.flash = friendlyError(msg.err)
 			return m, nil
 		}
 		if msg.ok {

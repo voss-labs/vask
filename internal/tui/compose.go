@@ -250,7 +250,7 @@ func (m composeModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case composePostedMsg:
 		m.sending = false
 		if msg.err != nil {
-			m.status = "couldn't post: " + msg.err.Error()
+			m.status = friendlyError(msg.err)
 			m.statusKind = "err"
 			return m, nil
 		}
