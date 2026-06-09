@@ -5,7 +5,12 @@
 // feels like the same product.
 package tui
 
-import "github.com/charmbracelet/lipgloss"
+import (
+	"regexp"
+	"strings"
+
+	"github.com/charmbracelet/lipgloss"
+)
 
 // AppWidth is the maximum content width. The frame is rendered at this
 // width and centered in the terminal viewport.
@@ -150,4 +155,26 @@ func renderKeySep() string {
 // text correctly.
 func hyperlink(url, text string) string {
 	return "\x1b]8;;" + url + "\x1b\\" + text + "\x1b]8;;\x1b\\"
+}
+
+var urlRegex = regexp.MustCompile(`https?://[^\s<>"]+`)
+
+// linkify finds URLs in s and wraps them in OSC 8 escape sequences so
+// they become clickable in supported terminals. It uses a simple
+// heuristic to strip trailing punctuation (like '.' or '!') that is
+// likely part of the surrounding sentence rather than the URL.
+func linkify(s string) string {
+	return urlRegex.ReplaceAllStringFunc(s, func(u string) string {
+		var trailing string
+		for len(u) > 0 {
+			last := u[len(u)-1]
+			if strings.ContainsRune(".,!?;:)]}", rune(last)) {
+				trailing = string(last) + trailing
+				u = u[:len(u)-1]
+			} else {
+				break
+			}
+		}
+		return hyperlink(u, u) + trailing
+	})
 }
