@@ -1517,6 +1517,7 @@ func wrap(s string, width int) string {
 		}
 		col := 0
 		for wi, word := range strings.Fields(line) {
+			word = linkify(word)
 			wlen := lipgloss.Width(word)
 			switch {
 			case wi == 0:
