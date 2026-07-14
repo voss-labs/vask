@@ -11,7 +11,7 @@ import (
 	"strings"
 )
 
-const draftModel = "@cf/google/gemma-3-12b-it"
+const draftModel = "@cf/aisingapore/gemma-sea-lion-v4-27b-it"
 
 type DraftVariant struct {
 	Title string   `json:"title"`
@@ -52,8 +52,11 @@ func (c *Client) Draft(ctx context.Context, dilemma string) ([]DraftVariant, err
 			{"role": "system", "content": draftSystem},
 			{"role": "user", "content": dilemma},
 		},
-		// gemma-3-12b-it is non-reasoning — emits ~50 tokens of JSON
-		// directly in 1-2s. 600 is generous headroom.
+		// sea-lion-v4 is non-reasoning — emits ~50 tokens of JSON
+		// directly in 1-2s. 600 is generous headroom. Do NOT swap in a
+		// reasoning model here: gemma-4 burns the whole budget on its
+		// thinking pass and returns empty content at any ceiling we'd
+		// accept latency-wise.
 		"max_tokens":  600,
 		"temperature": 0.8,
 	})

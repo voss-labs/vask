@@ -55,7 +55,7 @@ If `TURSO_DATABASE_URL` is unset, the binary falls back to a local SQLite file. 
 
 ## Embeddings — Cloudflare Workers AI (optional)
 
-Semantic search and compose tag suggestions run on `@cf/baai/bge-m3`. AI-assisted post drafting (firstpost nudge + `ctrl+d` in compose) runs on `@cf/google/gemma-3-12b-it`.
+Semantic search and compose tag suggestions run on `@cf/baai/bge-m3`. AI-assisted post drafting (firstpost nudge + `ctrl+d` in compose) runs on `@cf/aisingapore/gemma-sea-lion-v4-27b-it`.
 
 1. **Account ID** — dashboard → Workers & Pages → Overview → right sidebar.
 2. **Token** — dashboard → My Profile → API Tokens → Create token → "Workers AI" template.
